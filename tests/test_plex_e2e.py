@@ -330,3 +330,96 @@ def test_shared_user_gets_clear_403(plex, capsys):
     main(["add", "101", "--ignore-streams", "--pair", "en+es"])
     out = capsys.readouterr().out
     assert "needs the server OWNER" in out
+
+
+# ---------------------------------------------------------------------- fail fast / fetch missing
+
+def _only_english_external(plex):
+    """An item where only English is available (as an external track) plus Dutch inside the file."""
+    plex.items["101"]["streams"] = [s for s in plex.items["101"]["streams"] if s["id"] in (301, 304)]
+
+
+@needs_ffmpeg
+def test_no_file_read_when_a_pair_cannot_be_made(plex, monkeypatch, capsys):
+    """en+es: Spanish is missing, so the .mkv must not be read and nothing downloaded."""
+    import subprocess as sp
+    from dualsubs import plex as plexmod
+
+    _only_english_external(plex)
+    calls = []
+    real_run = sp.run
+    monkeypatch.setattr(plexmod.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd) or real_run(cmd, *a, **kw))
+    plex.requests.clear()
+    assert main(["add", "101", "--pair", "en+es"]) == 0
+    assert calls == []  # no ffmpeg
+    assert not [r for r in plex.requests if r.startswith("GET /library/streams/")]  # no subtitle download
+    assert "Spanish: no subtitles" in capsys.readouterr().out
+    # nl+en can be made and es+en can't: the file is read once, for the possible pair only.
+    calls.clear()
+    main(["add", "101", "--pair", "nl+en", "--pair", "es+en"])
+    assert len(calls) == 1 and calls[0].count("-map") == 1
+
+
+@needs_ffmpeg
+def test_impossible_items_are_remembered(plex, capsys):
+    _only_english_external(plex)
+    main(["add", "101", "--pair", "en+es"])
+    plex.requests.clear()
+    main(["add", "101", "--pair", "en+es", "-v"])
+    out = capsys.readouterr().out
+    assert "unchanged" in out
+    # Only the metadata lookup happened, nothing else.
+    assert plex.requests == ["GET /library/metadata/101"] or all("metadata/101" in r or "sessions" in r for r in plex.requests)
+    # A Spanish track appearing later reopens the item.
+    plex.add_external("101", 999, "spa", ES.encode())
+    main(["add", "101", "--pair", "en+es"])
+    assert "[EN+ES]: added" in capsys.readouterr().out
+
+
+@needs_ffmpeg
+def test_fetch_missing_downloads_then_merges(plex, capsys):
+    _only_english_external(plex)
+    plex.catalog[("101", "es")] = [{"key": "/os/es-1", "text": ES.encode(), "score": 0.9},
+                                   {"key": "/os/es-2", "text": b"x", "score": 0.5}]
+    assert main(["add", "101", "--pair", "en+es", "--fetch-missing"]) == 0
+    out = capsys.readouterr().out
+    assert "[EN+ES]: added" in out
+    assert ("101", "es") in plex.searches
+    assert "¿Dónde está el café?" in plex.uploads[-1]["body"].decode()
+
+
+@needs_ffmpeg
+def test_fetch_missing_none_found_is_not_repeated(plex, capsys):
+    _only_english_external(plex)
+    main(["add", "101", "--pair", "en+es", "--fetch-missing"])
+    assert plex.searches == [("101", "es")]
+    assert "Spanish: no subtitles; Plex's subtitle search found none" in capsys.readouterr().out
+    main(["add", "101", "--pair", "en+es", "--fetch-missing"])
+    assert plex.searches == [("101", "es")]  # remembered for 30 days
+
+
+@needs_ffmpeg
+def test_fetch_missing_respects_daily_limit_and_needs_one_language(plex, capsys, tmp_path):
+    import json
+    import time as _t
+
+    _only_english_external(plex)
+    plex.catalog[("101", "es")] = [{"key": "/os/es-1", "text": ES.encode()}]
+    plex.catalog[("101", "fr")] = [{"key": "/os/fr-1", "text": FR.encode()}]
+    state = tmp_path / "home" / "state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"_budget": {"date": _t.strftime("%Y-%m-%d"), "count": 2}}))
+    main(["add", "101", "--pair", "en+es", "--fetch-missing", "--fetch-limit", "2"])
+    assert plex.searches == [] and "daily download limit reached" in capsys.readouterr().out
+    # es+fr: both missing, so a single download couldn't complete the pair: don't search at all.
+    main(["add", "101", "--pair", "es+fr", "--fetch-missing", "--fetch-limit", "10"])
+    assert plex.searches == []
+
+
+@needs_ffmpeg
+def test_enabling_fetch_missing_reopens_missing_items(plex, capsys):
+    _only_english_external(plex)
+    main(["add", "101", "--pair", "en+es"])  # recorded as missing
+    plex.catalog[("101", "es")] = [{"key": "/os/es-1", "text": ES.encode()}]
+    main(["add", "101", "--pair", "en+es", "--fetch-missing"])
+    assert "[EN+ES]: added" in capsys.readouterr().out

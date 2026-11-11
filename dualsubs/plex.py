@@ -224,6 +224,31 @@ class Plex:
             raise PlexError(f"Subtitle stream {stream.id} has neither a key nor a container index")
         return extract_embedded(map_path(part.file, path_map), stream.index, stream.codec)
 
+    def search_subtitles(self, rating_key: str, lang: str) -> list[dict]:
+        """Plex's own on-demand subtitle search (OpenSubtitles), best match first.
+
+        This is what "Search subtitles" in a Plex app does. Only text formats are
+        returned, preferring exact release matches and non-SDH.
+        """
+        root = self._xml(f"/library/metadata/{rating_key}/subtitles",
+                         language=lang, hearingImpaired="3", forced="3")  # 3 = exclude SDH / forced
+        found = []
+        for s in root.iter("Stream"):
+            codec = (s.get("codec") or s.get("format") or "").lower()
+            if not s.get("key") or codec not in TEXT_CODECS:
+                continue
+            found.append({
+                "key": s.get("key"), "codec": codec, "provider": s.get("providerTitle", ""),
+                "perfect": _b(s.get("perfectMatch")), "score": float(s.get("score") or 0),
+                "sdh": _b(s.get("hearingImpaired")), "title": s.get("title") or s.get("displayTitle") or "",
+            })
+        found.sort(key=lambda f: (f["sdh"], not f["perfect"], -f["score"]))
+        return found
+
+    def download_found_subtitle(self, rating_key: str, found: dict) -> None:
+        """Have Plex download a search result. Plex fetches it in the background."""
+        self._req("PUT", f"/library/metadata/{rating_key}/subtitles", params={"key": found["key"]})
+
     def upload_subtitle(self, rating_key: str, data: bytes, filename: str) -> None:
         fmt = filename.rsplit(".", 1)[-1]
         self._req(

@@ -2,11 +2,14 @@
 merge them, upload the result and remember what we did."""
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
 import re
 import tempfile
+import time
+import weakref
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -47,6 +50,9 @@ class Settings:
     path_map: list = field(default_factory=list)
     min_paired: float = 0.3  # refuse merges where fewer cues line up than this
     filename: str = "dualsubs {P}+{S}.{p}.srt"
+    fetch_missing: bool = False  # ask Plex to search/download a missing language
+    fetch_limit: int = 50  # max subtitle downloads per day
+    fetch_retry_days: int = 30  # don't search again for a language Plex didn't find
 
     def __post_init__(self):
         pairs = []
@@ -82,17 +88,27 @@ class Result:
         return f"[{icon}] {self.title}{tag}: {self.status}" + (f" - {self.detail}" if self.detail else "")
 
 
+_OPEN_STATES: "weakref.WeakSet[State]" = weakref.WeakSet()
+atexit.register(lambda: [s.flush() for s in list(_OPEN_STATES)])
+
+
 class State:
     """Remembers what we produced per item and pair, so re-runs are cheap and idempotent.
 
     Layout: {ratingKey: {"en+es": {"signature": ..., "stream_ids": [...] | "sidecar": path}}}
     """
 
+    SAVE_EVERY_S = 15  # batch writes: a big library means a big state file
+
     def __init__(self, path: str | os.PathLike | None):
         self.path = Path(path) if path else None
         self.data: dict = {}
+        self._dirty = False
+        self._saved_at = time.time()
         if self.path and self.path.exists():
             self.data = json.loads(self.path.read_text() or "{}")
+        if self.path:
+            _OPEN_STATES.add(self)  # flushed at exit; weak, so a dropped State releases its lock
 
     def lock(self) -> bool:
         """Take an exclusive lock for this state file; False if another run holds it.
@@ -129,10 +145,35 @@ class State:
             entry["+".join(pair)] = value
         if not entry:
             self.data.pop(key, None)
-        self.save()
+        self._dirty = True
+        if time.time() - self._saved_at >= self.SAVE_EVERY_S:
+            self.save()
+
+    def flush(self) -> None:
+        if self._dirty:
+            self.save()
 
     def all_stream_ids(self, key: str) -> set[int]:
-        return {i for v in self.data.get(key, {}).values() for i in v.get("stream_ids", [])}
+        return {i for k, v in self.data.get(key, {}).items() if not k.startswith("_") for i in v.get("stream_ids", [])}
+
+    def items(self) -> list[str]:
+        return [k for k in self.data if not k.startswith("_")]
+
+    # -- per-item notes about subtitle searches, and the daily download budget
+    def fetch_note(self, key: str, lang: str) -> dict:
+        return self.data.get(key, {}).get("_fetch", {}).get(lang, {})
+
+    def set_fetch_note(self, key: str, lang: str, note: dict) -> None:
+        self.data.setdefault(key, {}).setdefault("_fetch", {})[lang] = note
+        self._dirty = True
+
+    def fetches_today(self) -> int:
+        b = self.data.get("_budget", {})
+        return b.get("count", 0) if b.get("date") == time.strftime("%Y-%m-%d") else 0
+
+    def count_fetch(self) -> None:
+        self.data["_budget"] = {"date": time.strftime("%Y-%m-%d"), "count": self.fetches_today() + 1}
+        self._dirty = True
 
     def save(self) -> None:
         if not self.path:
@@ -142,6 +183,8 @@ class State:
         with os.fdopen(fd, "w") as f:
             json.dump(self.data, f, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
+        self._dirty = False
+        self._saved_at = time.time()
 
 
 # ---------------------------------------------------------------------- selection
@@ -173,7 +216,12 @@ def _image_only(subs: list[SubStream], lang: str) -> bool:
 
 def process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dry_run=False, force=False,
                  save_to: str | None = None) -> list[Result]:
-    """Process every configured language pair for one movie/episode."""
+    """Process every configured language pair for one movie/episode.
+
+    Order matters for disk use: decide from Plex's metadata alone which pairs can
+    be made, fetch missing languages if allowed, and only then read the video file
+    (once) for the embedded tracks those pairs actually need.
+    """
     try:
         item = plex.item(rating_key)
     except PlexError as e:
@@ -181,8 +229,11 @@ def process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dr
     if not item.parts:
         return [Result(rating_key, item.title, "error", "item has no media file")]
 
+    pending = [pair for pair in cfg.pairs if force or not _context(item, pair, cfg, state)["up_to_date"]]
+    if cfg.fetch_missing and pending and not dry_run:
+        item = _fetch_missing(plex, item, pending, cfg, state)
     cache: dict[int, list] = {}  # stream id -> parsed cues, shared between pairs
-    _prefetch_embedded(plex, item, cfg, state, cache, force)
+    _prefetch_embedded(plex, item, cfg, state, cache, pending)
     results = []
     for pair in cfg.pairs:
         out = save_to if (save_to and len(cfg.pairs) == 1) else (
@@ -197,6 +248,10 @@ def process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dr
     return results
 
 
+# Outcomes worth remembering, so re-runs skip the item until its subtitles change.
+SETTLED = ("missing", "error", "low-match")
+
+
 def _context(item: Item, pair: Pair, cfg: Settings, state: State) -> dict:
     """What we know about one pair on one item, and whether it needs (re)doing."""
     prev = state.get(item.rating_key, pair)
@@ -208,8 +263,12 @@ def _context(item: Item, pair: Pair, cfg: Settings, state: State) -> dict:
         [cfg.fingerprint(pair), sorted((s.id, s.language, s.codec, s.forced) for s in sources)]
     ).encode()).hexdigest()[:16]
     done = mine if cfg.mode == "upload" else (prev.get("sidecar") and Path(prev["sidecar"]).exists())
+    settled = prev.get("status") in SETTLED
+    if settled and prev.get("status") == "missing" and cfg.fetch_missing:
+        # Turning on --fetch-missing reopens items whose missing language we haven't searched for yet.
+        settled = all(state.fetch_note(item.rating_key, lang) for lang in prev.get("missing", []))
     return {"prev": prev, "filename": filename, "mine": mine, "sources": sources, "signature": signature,
-            "up_to_date": bool(prev.get("signature") == signature and done)}
+            "up_to_date": bool(prev.get("signature") == signature and (done or settled))}
 
 
 def _can_read(item: Item, cfg: Settings) -> bool:
@@ -217,23 +276,27 @@ def _can_read(item: Item, cfg: Settings) -> bool:
     return bool(part.file) and os.path.exists(map_path(part.file, cfg.path_map))
 
 
-def _prefetch_embedded(plex: Plex, item: Item, cfg: Settings, state: State, cache: dict, force: bool) -> None:
-    """Pull every embedded track the pending pairs will want in one ffmpeg pass.
+def _missing_langs(sources: list[SubStream], pair: Pair, can_read: bool) -> list[str]:
+    return [lang for lang in pair if not candidates(sources, lang, can_read)]
 
-    ffmpeg reads the whole video file per run, so on large libraries one run per
-    file (instead of one per subtitle) is the difference that matters.
+
+def _prefetch_embedded(plex: Plex, item: Item, cfg: Settings, state: State, cache: dict, pending: list) -> None:
+    """Pull every embedded track the pending pairs need in ONE ffmpeg pass.
+
+    ffmpeg reads the whole video file per run. Pairs missing a language are left
+    out entirely: reading a file for half a pair would be wasted.
     """
-    if not _can_read(item, cfg):
+    if not pending or not _can_read(item, cfg):
         return
     wanted: dict[int, SubStream] = {}
-    for pair in cfg.pairs:
-        ctx = _context(item, pair, cfg, state)
-        if ctx["up_to_date"] and not force:
+    for pair in pending:
+        sources = _context(item, pair, cfg, state)["sources"]
+        if _missing_langs(sources, pair, True):
             continue
         for lang in pair:
-            cands = candidates(ctx["sources"], lang, True)
-            if cands and not cands[0].external and cands[0].index is not None and cands[0].id not in cache:
-                wanted[cands[0].id] = cands[0]
+            best = candidates(sources, lang, True)[0]
+            if not best.external and best.index is not None and best.id not in cache:
+                wanted[best.id] = best
     if not wanted:
         return
     part = item.parts[0]
@@ -246,27 +309,93 @@ def _prefetch_embedded(plex: Plex, item: Item, cfg: Settings, state: State, cach
         cache[s.id] = parse(data, fmt) if data else []
 
 
+def _fetch_missing(plex: Plex, item: Item, pending: list, cfg: Settings, state: State) -> Item:
+    """Ask Plex to find subtitles for languages a pair lacks (only when the other
+    language is there, so a download always completes a pair). Returns the
+    refreshed item."""
+    can_read = _can_read(item, cfg)
+    sources = [s for s in item.subtitles if not is_ours(s, state.all_stream_ids(item.rating_key))]
+    langs = []
+    for pair in pending:
+        missing = _missing_langs(sources, pair, can_read)
+        if len(missing) == 1 and missing[0] not in langs:
+            langs.append(missing[0])
+    fetched = False
+    for lang in langs:
+        note = state.fetch_note(item.rating_key, lang)
+        if note.get("result") == "none" and time.time() - note.get("at", 0) < cfg.fetch_retry_days * 86400:
+            continue  # searched recently and Plex found nothing
+        if state.fetches_today() >= cfg.fetch_limit:
+            return item  # budget used up; try again tomorrow (nothing recorded)
+        try:
+            found = plex.search_subtitles(item.rating_key, lang)
+        except PlexError:
+            continue
+        if not found:
+            state.set_fetch_note(item.rating_key, lang, {"result": "none", "at": time.time()})
+            continue
+        try:
+            plex.download_found_subtitle(item.rating_key, found[0])
+        except PlexError as e:
+            state.set_fetch_note(item.rating_key, lang, {"result": "error", "at": time.time(), "detail": str(e)[:200]})
+            continue
+        state.count_fetch()
+        state.set_fetch_note(item.rating_key, lang, {"result": "downloaded", "at": time.time(),
+                                                     "from": found[0].get("provider", "")})
+        fetched = True
+    if not fetched:
+        return item
+    # Plex downloads in the background; wait briefly for the new track(s) to appear.
+    for _ in range(FETCH_WAIT_TRIES):
+        fresh = plex.item(item.rating_key)
+        have = {s.language for s in fresh.subtitles if s.is_text}
+        if all(lang in have for lang in langs if state.fetch_note(item.rating_key, lang).get("result") == "downloaded"):
+            return fresh
+        time.sleep(FETCH_WAIT_S)
+    return plex.item(item.rating_key)
+
+
+FETCH_WAIT_TRIES, FETCH_WAIT_S = 15, 2
+
+
 def _process_pair(plex: Plex, item: Item, pair: Pair, cfg: Settings, state: State, cache: dict, *,
                   dry_run, force, save_to) -> Result:
-    def result(status, detail="", stats=None):
-        return Result(item.rating_key, item.title, status, detail, stats, pair)
-
     part = item.parts[0]
     ctx = _context(item, pair, cfg, state)
     prev, filename, mine, sources, signature = (ctx[k] for k in ("prev", "filename", "mine", "sources", "signature"))
-    if not force and ctx["up_to_date"]:
-        return result("up-to-date")
 
+    def result(status, detail="", stats=None, **remember):
+        if status in SETTLED and not dry_run:
+            state.set(item.rating_key, pair, {"signature": signature, "status": status, **remember})
+        return Result(item.rating_key, item.title, status, detail, stats, pair)
+
+    if not force and ctx["up_to_date"]:
+        # "unchanged": we already know this pair can't be made here, and nothing changed since.
+        status = "unchanged" if prev.get("status") in SETTLED else "up-to-date"
+        return Result(item.rating_key, item.title, status, prev.get("status", ""), None, pair)
+
+    # Fail fast, from metadata only: both languages must be there before anything is read.
     can_read = _can_read(item, cfg)
-    picked = {}
-    for lang in pair:
-        cands = candidates(sources, lang, can_read)
-        if not cands:
+    missing = _missing_langs(sources, pair, can_read)
+    if missing:
+        whys = []
+        for lang in missing:
             why = ("only image-based (PGS/VobSub) subtitles, which can't be merged as text"
                    if _image_only(sources, lang) else "no subtitles")
-            return result("missing", f"{lang_name(lang)}: {why}")
+            note = state.fetch_note(item.rating_key, lang)
+            if cfg.fetch_missing and dry_run:
+                why += " (--fetch-missing would search Plex for them)"
+            elif note.get("result") == "none":
+                why += "; Plex's subtitle search found none"
+            elif cfg.fetch_missing and len(missing) == 1 and not note and state.fetches_today() >= cfg.fetch_limit:
+                why += "; daily download limit reached, will search another day"
+            whys.append(f"{lang_name(lang)}: {why}")
+        return result("missing", "; ".join(whys), missing=missing)
+
+    picked = {}
+    for lang in pair:
         errors = []
-        for s in cands:
+        for s in candidates(sources, lang, can_read):
             try:
                 if s.id not in cache:
                     data, fmt = plex.download_subtitle(s, part, cfg.path_map)
@@ -327,7 +456,7 @@ def remove_item(plex: Plex, rating_key: str, state: State, pairs: list | None = 
     removed = 0
     if pairs is None:
         targets = [s for s in item.subtitles if is_ours(s, state.all_stream_ids(rating_key))]
-        pairs = [tuple(k.split("+")) for k in entry]
+        pairs = [tuple(k.split("+")) for k in entry if not k.startswith("_")]
     else:
         targets = []
         for pair in pairs:

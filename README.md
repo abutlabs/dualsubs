@@ -33,6 +33,13 @@ before. Plex remembers your subtitle choice per show.
 5. It remembers what it did, so re-runs skip finished items, and it refreshes an
    item when its source subtitles change.
 
+dualsubs combines subtitles that already exist. A pair is only made when **both**
+languages are there, and that is checked from Plex's metadata *before* any video
+file is read. Items that can't make a pair are noted and skipped on later runs
+until their subtitles change. In practice many items have subtitles in only one
+language (WEB-DL releases usually carry many languages, other releases often
+only English). To fill those gaps, see [Fetching missing subtitles](#fetching-missing-subtitles).
+
 ## Install
 
 dualsubs runs **on your Plex server**: a seedbox, NAS or home server. It has to
@@ -173,6 +180,15 @@ works at a time. If cron fires while a long run from step 5 is still going, or
 while someone is watching, it logs "skipped" and tries again next time. You
 don't need `flock` or `nice` in the cron line; dualsubs handles both itself.
 
+Add a second, nightly line for subtitles that turn up later on *older* items
+(Plex downloads, Bazarr, a file you added by hand). `watch --once` only looks at
+recently added items, so it would miss those. A full `scan` is cheap once the
+library has been processed: unchanged items are skipped without reading anything.
+
+```
+30 4 * * *  $HOME/.local/bin/dualsubs scan >> $HOME/dualsubs.log 2>&1
+```
+
 (If cron isn't available, `dualsubs watch` keeps running and checks every 10
 minutes, for example in tmux. That stops if the server reboots.)
 
@@ -182,8 +198,13 @@ minutes, for example in tmux. That stops if the server reboots.)
 ssh plex-server 'cd ~/dualsubs && git pull && ./install.sh'
 ```
 
-Cron picks up the new version on its next run. If you have a `watch` running in
-tmux, restart it.
+Cron picks up the new version on its next run. A run in tmux keeps using the
+old version until restarted. Stopping it is safe, because finished items are
+skipped when it starts again:
+
+```bash
+ssh plex-server 'tmux kill-session -t dualsubs'      # then start it again as in step 5
+```
 
 ### Uninstall
 
@@ -242,6 +263,32 @@ dualsubs merge nl.srt en.srt -o both.srt   # offline, no Plex needed
 On the TV, start playback, open subtitles and pick the track for your pair,
 e.g. **"dualsubs EN+ES"**. The exact label depends on your Plex version; `add`
 prints what Plex calls it.
+
+## Fetching missing subtitles
+
+With `--fetch-missing` (or `"fetch_missing": true` in the config), dualsubs asks
+Plex's built-in subtitle search, the same one as "Search subtitles" in a Plex
+app, to download the language a pair is missing, then merges as usual:
+
+```bash
+dualsubs add library:Movies --fetch-missing
+```
+
+- It only searches when the **other** language of the pair is already there, so
+  every download completes a pair.
+- It prefers exact release matches and skips SDH and forced subtitles. A
+  downloaded file is often timed for a different release; the automatic re-sync
+  takes care of that. If the timing still doesn't match, the item is skipped
+  ("barely line up") instead of getting bad subtitles.
+- Plex's subtitle provider limits downloads, so dualsubs caps them at **50 per
+  day** (`--fetch-limit N`). When the cap is reached, it carries on merging and
+  searches again the next day. If a search finds nothing, that title isn't
+  searched again for 30 days.
+- Turning it on later reopens items that were skipped for a missing language.
+
+For heavier gap-filling (many subtitle sites, automatic re-timing), run
+[Bazarr](https://www.bazarr.media/) next to Plex. dualsubs picks up whatever it
+downloads on the nightly `scan`.
 
 ## Style options
 

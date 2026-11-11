@@ -20,7 +20,9 @@ class FakePlex:
         self.next_id = 9000
         self.uploads: list[dict] = []
         self.requests: list[str] = []
-        self.sessions: list[str] = []  # player states, e.g. ["playing", "paused"]
+        self.sessions: list[str] = []
+        self.catalog: dict[tuple, list[dict]] = {}  # (ratingKey, lang) -> search results
+        self.searches: list[tuple] = []  # player states, e.g. ["playing", "paused"]
         self.deny_writes = False  # behave like a shared (non-owner) user
 
     def add_movie(self, rk, title, file, streams, year="2024"):
@@ -70,6 +72,24 @@ class FakePlex:
         if parts[:2] == ["library", "metadata"] and len(parts) == 3 and method == "GET":
             rk = parts[2]
             return (200, f"<MediaContainer>{self._video(rk)}</MediaContainer>") if rk in self.items else (404, "")
+        if parts[:2] == ["library", "metadata"] and parts[3:] == ["subtitles"] and method == "GET":
+            rk, lang = parts[2], query["language"][0]
+            self.searches.append((rk, lang))
+            res = "".join(
+                f'<Stream id="{80000 + i}" streamType="3" key="{r["key"]}" codec="srt" languageCode="{lang}" '
+                f'providerTitle="OpenSubtitles" score="{r.get("score", 1)}" perfectMatch="{r.get("perfect", 0)}"/>'
+                for i, r in enumerate(self.catalog.get((rk, lang), [])))
+            return 200, f"<MediaContainer>{res}</MediaContainer>"
+        if parts[:2] == ["library", "metadata"] and parts[3:] == ["subtitles"] and method == "PUT":
+            rk, key = parts[2], query["key"][0]
+            for (crk, lang), results in self.catalog.items():
+                for r in results:
+                    if crk == rk and r["key"] == key:
+                        sid = self.next_id
+                        self.next_id += 1
+                        self.add_external(rk, sid, lang, r["text"], providerTitle="OpenSubtitles")
+                        return 200, ""
+            return 404, ""
         if parts[:2] == ["library", "metadata"] and parts[3:] == ["subtitles"] and method == "POST":
             rk = parts[2]
             title = query["title"][0]

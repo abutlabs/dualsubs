@@ -66,6 +66,12 @@ def build(args, lock: bool = False):
         sys.exit(f"--priority must be low, idle or normal, not {plexmod.PRIORITY!r}")
     args._yield = not getattr(args, "ignore_streams", False) and cfg.get("yield_to_streams", True) \
         and os.environ.get("DUALSUBS_YIELD_TO_STREAMS", "1") != "0"
+    if lock:
+        # tmux kill-session / kill send SIGHUP / SIGTERM: exit through Python so
+        # the latest progress is written to the state file.
+        import signal
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(sig, lambda *_: sys.exit(143))
     if lock and plexmod.PRIORITY != "normal":
         try:
             os.nice(19 - os.nice(0))  # background job: this process too, not just ffmpeg
@@ -76,6 +82,8 @@ def build(args, lock: bool = False):
         style=style_from(args, cfg),
         mode=_opt(args, "mode", "DUALSUBS_MODE", cfg, "upload"),
         path_map=path_map,
+        fetch_missing=bool(getattr(args, "fetch_missing", False) or cfg.get("fetch_missing", False)),
+        fetch_limit=int(_opt(args, "fetch_limit", "DUALSUBS_FETCH_LIMIT", cfg, 50)),
     )
     state = State(_opt(args, "state", "DUALSUBS_STATE", cfg) or config_dir() / "state.json")
     if lock and not getattr(args, "dry_run", False) and not state.lock():
@@ -182,8 +190,9 @@ def run_items(plex, settings, state, keys, args) -> int:
         for res in process_item(plex, k, settings, state, dry_run=args.dry_run, force=args.force,
                                 save_to=getattr(args, "save", None)):
             counts[res.status] = counts.get(res.status, 0) + 1
-            if res.status != "up-to-date" or args.verbose:
+            if res.status not in ("up-to-date", "unchanged") or args.verbose:
                 print(res.line(), flush=True)
+    state.flush()
     print("Summary: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) if counts else "Nothing to do.")
     return 1 if counts.get("error") else 0
 
@@ -263,7 +272,7 @@ def cmd_remove(args):
     plex, settings, state = build(args, lock=True)
     pairs = settings.pairs if (args.pair or args.primary or args.secondary) else None
     # "all": only items we've touched (from the state file), not the whole library.
-    keys = list(state.data) if args.target == "all" else resolve_targets(plex, args.target)
+    keys = state.items() if args.target == "all" else resolve_targets(plex, args.target)
     for k in keys:
         try:
             print(remove_item(plex, k, state, pairs).line(), flush=True)
@@ -288,8 +297,9 @@ def cmd_watch(args):
             for k in keys:
                 gate.wait()
                 for res in process_item(plex, k, settings, state):
-                    if res.status != "up-to-date":
+                    if res.status not in ("up-to-date", "unchanged"):
                         print(time.strftime("%Y-%m-%d %H:%M ") + res.line(), flush=True)
+            state.flush()
         except (PlexError, OSError) as e:
             print(f"{time.strftime('%Y-%m-%d %H:%M')} [!] {e}", flush=True)
         if args.once:
@@ -335,6 +345,11 @@ def main(argv=None):
     work.add_argument("--priority", choices=["low", "idle", "normal"],
                       help="CPU/disk priority for reading video files: low (default) yields to Plex and seeding, "
                            "idle only reads when the disk is otherwise unused, normal is full speed")
+    work.add_argument("--fetch-missing", action="store_true",
+                      help="when a pair lacks one language, ask Plex's subtitle search to download it "
+                           "(capped per day; see --fetch-limit)")
+    work.add_argument("--fetch-limit", type=int, metavar="N",
+                      help="max subtitle downloads per day with --fetch-missing (default 50)")
     work.add_argument("--ignore-streams", action="store_true",
                       help="don't pause while someone is watching on Plex (default: pause)")
     work.add_argument("-n", "--dry-run", action="store_true", help="show what would happen, change nothing")
