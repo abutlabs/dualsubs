@@ -92,6 +92,26 @@ _OPEN_STATES: "weakref.WeakSet[State]" = weakref.WeakSet()
 atexit.register(lambda: [s.flush() for s in list(_OPEN_STATES)])
 
 
+class _write_lock:
+    """Short exclusive lock around reading-merging-writing the state file."""
+
+    def __init__(self, path: Path):
+        self.path = path.with_name(path.name + ".write")
+
+    def __enter__(self):
+        try:
+            import fcntl
+            self.f = open(self.path, "w")
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except ImportError:
+            self.f = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.f:
+            self.f.close()
+
+
 class State:
     """Remembers what we produced per item and pair, so re-runs are cheap and idempotent.
 
@@ -103,7 +123,8 @@ class State:
     def __init__(self, path: str | os.PathLike | None):
         self.path = Path(path) if path else None
         self.data: dict = {}
-        self._dirty = False
+        self._dirty: set = set()  # top-level keys we changed since the last save
+        self._fetched = 0  # downloads we made since the last save
         self._saved_at = time.time()
         if self.path and self.path.exists():
             self.data = json.loads(self.path.read_text() or "{}")
@@ -145,7 +166,7 @@ class State:
             entry["+".join(pair)] = value
         if not entry:
             self.data.pop(key, None)
-        self._dirty = True
+        self._dirty.add(key)
         if time.time() - self._saved_at >= self.SAVE_EVERY_S:
             self.save()
 
@@ -165,32 +186,57 @@ class State:
 
     def set_fetch_note(self, key: str, lang: str, note: dict) -> None:
         self.data.setdefault(key, {}).setdefault("_fetch", {})[lang] = note
-        self._dirty = True
+        self._dirty.add(key)
 
     def set_info(self, item) -> None:
         """Remember where an item lives, for the overview in `dualsubs web`."""
         self.data.setdefault(item.rating_key, {})["_info"] = {
             "lib": item.library_id, "library": item.library, "title": item.title,
             "show": item.show, "type": item.type}
-        self._dirty = True
+        self._dirty.add(item.rating_key)
 
-    def fetches_today(self) -> int:
-        b = self.data.get("_budget", {})
+    @staticmethod
+    def _count_today(data: dict) -> int:
+        b = data.get("_budget", {})
         return b.get("count", 0) if b.get("date") == time.strftime("%Y-%m-%d") else 0
 
+    def fetches_today(self) -> int:
+        return self._count_today(self.data) + self._fetched
+
     def count_fetch(self) -> None:
-        self.data["_budget"] = {"date": time.strftime("%Y-%m-%d"), "count": self.fetches_today() + 1}
-        self._dirty = True
+        self._fetched += 1
+        self._dirty.add("_budget")
 
     def save(self) -> None:
+        """Write our changes, merged into whatever is on disk now.
+
+        Another dualsubs process (a repair from `dualsubs web` next to a long
+        library run) may have saved its own items in the meantime; we only
+        replace the items *we* changed, under a short write lock.
+        """
         if not self.path:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state")
-        with os.fdopen(fd, "w") as f:
-            json.dump(self.data, f, indent=1, sort_keys=True)
-        os.replace(tmp, self.path)
-        self._dirty = False
+        with _write_lock(self.path):
+            try:
+                disk = json.loads(self.path.read_text() or "{}") if self.path.exists() else {}
+            except ValueError:
+                disk = {}
+            for key in self._dirty - {"_budget"}:
+                if key in self.data:
+                    disk[key] = self.data[key]
+                else:
+                    disk.pop(key, None)
+            if self._fetched:
+                # Several processes may download on the same day: add ours to theirs.
+                disk["_budget"] = {"date": time.strftime("%Y-%m-%d"), "count": self._count_today(disk) + self._fetched}
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state")
+            with os.fdopen(fd, "w") as f:
+                json.dump(disk, f, separators=(",", ":"))  # compact: thousands of items
+            os.replace(tmp, self.path)
+        self.data = disk  # pick up what other processes wrote
+        self._dirty = set()
+        self._fetched = 0
         self._saved_at = time.time()
 
 
@@ -221,8 +267,49 @@ def _image_only(subs: list[SubStream], lang: str) -> bool:
 
 # ---------------------------------------------------------------------- processing
 
+class item_lock:
+    """Per-item lock across processes, so a repair from `dualsubs web` and a
+    library run never work on the same item at once. One file, one byte-range
+    lock per ratingKey (no file clutter)."""
+
+    def __init__(self, state: State, rating_key: str):
+        self.path = state.path.with_name(state.path.name + ".items") if state.path else None
+        self.offset = int(rating_key) if str(rating_key).isdigit() else abs(hash(rating_key)) % (1 << 40)
+        self.f = None
+
+    def __enter__(self) -> bool:
+        if not self.path:
+            return True
+        try:
+            import fcntl
+        except ImportError:
+            return True
+        self.f = open(self.path, "a+b")
+        try:
+            fcntl.lockf(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, self.offset)
+            return True
+        except OSError:
+            self.f.close()
+            self.f = None
+            return False
+
+    def __exit__(self, *exc):
+        if self.f:
+            self.f.close()  # releases the lock
+
+
 def process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dry_run=False, force=False,
                  save_to: str | None = None) -> list[Result]:
+    if dry_run:
+        return _process_item(plex, rating_key, cfg, state, dry_run=dry_run, force=force, save_to=save_to)
+    with item_lock(state, rating_key) as got:
+        if not got:
+            return [Result(rating_key, rating_key, "busy", "another dualsubs process is working on this item")]
+        return _process_item(plex, rating_key, cfg, state, dry_run=dry_run, force=force, save_to=save_to)
+
+
+def _process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dry_run=False, force=False,
+                  save_to: str | None = None) -> list[Result]:
     """Process every configured language pair for one movie/episode.
 
     Order matters for disk use: decide from Plex's metadata alone which pairs can
@@ -268,9 +355,17 @@ def _context(item: Item, pair: Pair, cfg: Settings, state: State) -> dict:
     all_ours = [s for s in item.subtitles if is_ours(s, state.all_stream_ids(item.rating_key))]
     mine = [s for s in all_ours if belongs_to(s, pair, prev, filename)]
     sources = [s for s in item.subtitles if s not in all_ours]
-    signature = hashlib.sha1(json.dumps(
-        [cfg.fingerprint(pair), sorted((s.id, s.language, s.codec, s.forced) for s in sources)]
-    ).encode()).hexdigest()[:16]
+    def sig(subs):
+        return hashlib.sha1(json.dumps(
+            [cfg.fingerprint(pair), sorted((s.id, s.language, s.codec, s.forced) for s in subs)]
+        ).encode()).hexdigest()[:16]
+
+    # Only this pair's languages count: a French track turning up shouldn't redo EN+ES.
+    signature = sig([s for s in sources if s.language in pair])
+    if prev.get("signature") and prev["signature"] != signature and prev["signature"] == sig(sources):
+        # Recorded by dualsubs <= 0.3 (signature over all languages): still valid, upgrade in place.
+        prev = {**prev, "signature": signature}
+        state.set(item.rating_key, pair, prev)
     done = mine if cfg.mode == "upload" else (prev.get("sidecar") and Path(prev["sidecar"]).exists())
     settled = prev.get("status") in SETTLED
     if settled and prev.get("status") == "missing" and cfg.fetch_missing:
@@ -365,6 +460,40 @@ def _fetch_missing(plex: Plex, item: Item, pending: list, cfg: Settings, state: 
 
 
 FETCH_WAIT_TRIES, FETCH_WAIT_S = 15, 2
+
+
+def compatibility(item: Item, cfg: Settings, state: State) -> dict:
+    """What each language pair can do for this item, from Plex's metadata only (no file reads).
+
+    Per pair, status is one of:
+      done       a bilingual track is in Plex
+      ready      both languages are there; a run will make the track
+      missing    one or both languages are missing (see "missing"); --fetch-missing can try
+                 when only one is missing
+      low-match / error   tried before and couldn't make a good track
+    """
+    can_read = _can_read(item, cfg) if item.parts else False
+    sources = [s for s in item.subtitles if not is_ours(s, state.all_stream_ids(item.rating_key))]
+    text = sorted({s.language for s in sources if s.is_text and s.language})
+    image = sorted({s.language for s in sources if not s.is_text and s.language} - set(text))
+    pairs = {}
+    for pair in cfg.pairs:
+        ctx = _context(item, pair, cfg, state)
+        prev = ctx["prev"]
+        missing = _missing_langs(ctx["sources"], pair, can_read)
+        notes = {lang: state.fetch_note(item.rating_key, lang).get("result") for lang in missing}
+        if ctx["mine"] or (cfg.mode == "sidecar" and prev.get("sidecar")):
+            status = "done"
+        elif missing:
+            status = "missing"
+        elif prev.get("status") in ("low-match", "error") and ctx["up_to_date"]:
+            status = prev["status"]
+        else:
+            status = "ready"
+        pairs["+".join(pair)] = {"status": status, "missing": missing,
+                                 "searched": {k: v for k, v in notes.items() if v}}
+    return {"ratingKey": item.rating_key, "title": item.title, "show": item.show, "type": item.type,
+            "languages": text, "image_only": image, "pairs": pairs}
 
 
 def _process_pair(plex: Plex, item: Item, pair: Pair, cfg: Settings, state: State, cache: dict, *,

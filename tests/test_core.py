@@ -113,3 +113,29 @@ def test_in_sync_not_touched():
 def test_write_srt_roundtrip():
     cues = parse(SRT)
     assert parse(write_srt(cues)) == cues
+
+
+def test_state_merges_concurrent_writers(tmp_path):
+    """A repair (process B) and a library run (process A) save the same file."""
+    from types import SimpleNamespace
+
+    from dualsubs.pipeline import State
+
+    path = tmp_path / "state.json"
+    a, b = State(path), State(path)
+    a.set("1", ("en", "es"), {"signature": "s1", "stream_ids": [1]})
+    a.save()
+    b.set("2", ("en", "es"), {"signature": "s2", "stream_ids": [2]})
+    b.set_info(SimpleNamespace(rating_key="2", library_id="1", library="TV", title="x", show="", type="episode"))
+    b.count_fetch()
+    b.save()  # must keep A's item 1
+    a.set("3", ("en", "es"), {"signature": "s3", "stream_ids": [3]})
+    a.count_fetch()
+    a.save()  # must keep B's item 2
+    final = State(path)
+    assert sorted(final.items()) == ["1", "2", "3"]
+    assert final.get("2")["_info"]["library"] == "TV"
+    assert final.fetches_today() == 2  # one download each, added up
+    a.set("1", ("en", "es"), None)
+    a.save()
+    assert sorted(State(path).items()) == ["2", "3"]

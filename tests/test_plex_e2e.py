@@ -429,3 +429,63 @@ def test_doctor(plex, capsys):
     assert main(["doctor"]) in (0, 1)
     out = capsys.readouterr().out
     assert "[ok  ] Python" in out and "'FakePlex'" in out and "Movies" in out and "NL+EN" in out
+
+
+@needs_ffmpeg
+def test_check_reports_without_changing_anything(plex, capsys):
+    import subprocess as sp
+    from dualsubs import plex as plexmod
+
+    plex.items["101"]["streams"] = [s for s in plex.items["101"]["streams"] if s.get("languageCode") != "fre"]
+    main(["add", "101", "--pair", "nl+en"])
+    capsys.readouterr()
+    plex.requests.clear()
+    calls = []
+    orig = sp.run
+    plexmod.subprocess.run = lambda *a, **k: calls.append(a) or orig(*a, **k)
+    try:
+        main(["check", "Koffie", "--pair", "nl+en", "--pair", "en+es", "--pair", "en+fr", "--pair", "de+en"])
+    finally:
+        plexmod.subprocess.run = orig
+    out = capsys.readouterr().out
+    line = [ln for ln in out.splitlines() if ln.startswith("Koffie")][0]
+    assert "done" in line and "ready" in line and "no fr" in line and "no de" in line
+    assert "(image: de)" in line
+    assert calls == [] and plex.uploads and len(plex.uploads) == 1
+    assert not [r for r in plex.requests if not r.startswith("GET")]
+
+
+@needs_ffmpeg
+def test_new_track_in_another_language_does_not_redo_pairs(plex, capsys):
+    plex.items["101"]["streams"] = [s for s in plex.items["101"]["streams"] if s["id"] in (301, 304)]
+    main(["add", "101", "--pair", "nl+en"])
+    plex.add_external("101", 777, "spa", ES.encode())  # e.g. Bazarr adds Spanish
+    main(["add", "101", "--pair", "nl+en", "--pair", "en+es"])
+    assert [u["title"] for u in plex.uploads] == ["dualsubs NL+EN.nl.srt", "dualsubs EN+ES.en.srt"]
+
+
+@needs_ffmpeg
+def test_state_from_older_versions_is_still_up_to_date(plex, capsys, tmp_path):
+    """Upgrading must not redo (and re-read files for) everything already processed."""
+    import hashlib
+    import json as _j
+    from dualsubs.pipeline import Settings, State
+
+    main(["add", "101", "--pair", "nl+en"])
+    path = tmp_path / "home" / "state.json"
+    st = State(path)
+    cfg = Settings(pairs=["nl+en"])
+    # Rewrite the stored signature the way 0.3 computed it: over every source track.
+    srcs = [s for s in plex.items["101"]["streams"] if "dualsubs" not in s.get("title", "")]
+    from dualsubs.plex import Plex
+    item = Plex(__import__("os").environ["PLEX_URL"], "test-token").item("101")
+    sources = [s for s in item.subtitles if "dualsubs" not in (s.title or "")]
+    old = hashlib.sha1(_j.dumps([cfg.fingerprint(("nl", "en")),
+                                 sorted((s.id, s.language, s.codec, s.forced) for s in sources)]).encode()).hexdigest()[:16]
+    entry = st.get("101", ("nl", "en"))
+    st.set("101", ("nl", "en"), {**entry, "signature": old})
+    st.save()
+    capsys.readouterr()
+    main(["add", "101", "--pair", "nl+en", "-v"])
+    assert "up-to-date" in capsys.readouterr().out and len(plex.uploads) == 1
+    assert State(path).get("101", ("nl", "en"))["signature"] != old  # upgraded in place

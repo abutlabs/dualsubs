@@ -263,32 +263,61 @@ the file yourself, run `./scripts/build-pyz.sh`; the result is `dist/dualsubs`.
 
 ## Status page
 
-`dualsubs web` serves a small page that shows:
+The status page runs on the server and you open it from your own computer:
 
 - **Current run:** what it's doing, how far it is (X of Y), whether it's paused
   for someone watching, and the latest results.
+- **Check a show or movie:** search your library and see, per episode, which
+  subtitle languages exist and whether each pair is **done**, **ready** (both
+  languages there; the next run makes it) or **missing** a language. This only
+  reads Plex's information, never the video files.
+- **Repair:** one button per show or movie. It fetches the missing language
+  through Plex's subtitle search, asking for subtitles that match your exact
+  release first, then makes the tracks. It stays within the daily download
+  limit, shows progress, pauses for viewers, and can run while a library run is
+  going. (They never work on the same item at once.) "Make tracks" does the same
+  without downloading anything.
 - **Library coverage:** for each library and each language pair, how many items
   have a bilingual track, how many are missing a language (and which language
   is missing most), and how many haven't been checked yet.
 - **Language pairs:** add or remove pairs, and switch fetching missing
   subtitles on or off. Changes apply from the next run.
 
-It listens only on the server itself and needs an access key, because on a
-shared seedbox other users can reach the server's local ports too. The easiest
-way to open it is one command from your computer. It starts the page and
-tunnels it to you, and stops when you press Ctrl-C:
+### Open it with one command: `dualsubs ui`
+
+Install dualsubs on **your own computer** too. It's the same single file and
+runs on macOS and Linux with the built-in `python3`:
+
+```bash
+mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/dualsubs https://github.com/abutlabs/dualsubs/releases/latest/download/dualsubs && chmod +x ~/.local/bin/dualsubs
+```
+
+Then, from your terminal:
+
+```bash
+dualsubs ui plex-server
+```
+
+It connects over SSH, starts the page on the server, tunnels it to your computer
+and opens your browser, with the access key filled in. Ctrl-C closes it. It picks
+free ports itself. If dualsubs lives somewhere else on the server, add
+`--remote-cmd /path/to/dualsubs`. (If `~/.local/bin` isn't on your PATH, run
+`~/.local/bin/dualsubs ui plex-server`.)
+
+### Without installing anything locally
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 plex-server '~/.local/bin/dualsubs web'
 ```
 
-Open the link it prints (`http://localhost:8765/?key=...`) in your browser. The
-key is remembered after the first visit. If port 8765 is taken on the server,
-use another one on both sides, e.g. `ssh -L 8790:127.0.0.1:8790 plex-server
-'~/.local/bin/dualsubs web --port 8790'`.
+Open the link it prints (`http://localhost:8765/?key=...`). If port 8765 is
+taken on the server, use another one on both sides of that command.
 
-The page only reads dualsubs' own files and asks Plex for library sizes, so it
-is safe to leave open while a run is going.
+### Why the key
+
+The page listens only on the server itself, but on a shared seedbox other
+customers can reach the server's local ports too. The access key keeps them
+out. After the first visit it's remembered in a browser cookie.
 
 ## Language pairs
 
@@ -309,6 +338,11 @@ the `DUALSUBS_PAIRS=en+es,en+fr` environment variable. Language names work too:
 `--pair English+Spanish`. An item only gets a pair's track if it has subtitles
 in both languages; otherwise dualsubs reports which one is missing.
 
+One pair per language combination is enough: EN+ES and ES+EN show the same two
+lines, only swapped. The status page won't add the reverse of an existing pair,
+and `dualsubs doctor` points it out. To take tracks for a pair you no longer
+want out of Plex: `dualsubs remove all --pair es+en`.
+
 ## Commands
 
 Run these on the server, i.e. as `ssh plex-server '~/.local/bin/dualsubs ...'`.
@@ -318,7 +352,8 @@ run it from your own terminal, e.g. `dualsubs add '"The Bear"'`. Titles with
 spaces need both quote types like that, because they pass through two shells.
 
 ```bash
-dualsubs inspect "The Bear"          # what subtitle tracks does Plex have?
+dualsubs check "The Bear"            # per episode: done / ready / missing a language
+dualsubs inspect "The Bear"          # every subtitle track Plex has, in detail
 dualsubs add "The Bear" --dry-run    # what would happen, changing nothing
 dualsubs add "The Bear"              # whole show (or a movie, season, ratingKey)
 dualsubs add library:Movies          # a whole library
@@ -329,6 +364,7 @@ dualsubs remove "The Bear"           # take all bilingual tracks off again
 dualsubs remove "The Bear" --pair en+fr   # ...or just one pair
 dualsubs remove all                  # every track dualsubs ever added
 dualsubs web                         # status page (see above)
+dualsubs ui plex-server              # on your computer: open the status page
 dualsubs doctor                      # check the setup
 dualsubs merge nl.srt en.srt -o both.srt   # offline, no Plex needed
 ```

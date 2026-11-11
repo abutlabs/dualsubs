@@ -90,6 +90,8 @@ def test_status_shows_coverage_and_progress(plex, portal):  # noqa: F811
     assert p["en+es"]["done"] == 1 and p["en+fr"]["missing"] == 1
     assert s["libraries"][0]["missing_langs"] == {"fr": 1}
     assert _post(base + "/api/pairs", {"pairs": ["en+en"]}, cookie)[0] == 400
+    code, out = _post(base + "/api/pairs", {"pairs": ["en+es", "es+en"]}, cookie)
+    assert code == 400 and "swapped" in out["error"]
     assert _post(base + "/api/pairs", {"pairs": []}, cookie)[0] == 400
     assert _post(base + "/api/fetch", {"enabled": True}, cookie)[0] == 200
     assert cli.load_config()["fetch_missing"] is True
@@ -105,3 +107,73 @@ def test_progress_reports_dead_runs_as_stopped(tmp_path):
     data["pid"] = 999999999
     path.write_text(json.dumps(data))
     assert progress.read(path)["state"] == "stopped"
+
+
+def _wait_job(base, cookie, timeout=30):
+    import time
+    for _ in range(timeout * 10):
+        job = json.loads(_get(base + "/api/job", cookie)[2])["job"]
+        if job and job["state"] not in ("running", "paused"):
+            return job
+        time.sleep(0.1)
+    raise AssertionError("job did not finish")
+
+
+@needs_ffmpeg
+def test_search_check_and_repair(plex, portal):  # noqa: F811
+    base, key = portal
+    cookie = f"dualsubs_key={key}"
+    # Only English and Dutch (embedded) remain; Spanish can be fetched from Plex's search.
+    plex.items["101"]["streams"] = [s for s in plex.items["101"]["streams"] if s["id"] in (301, 304)]
+    plex.catalog[("101", "es")] = [{"key": "/os/es-1", "text": ES.encode(), "perfect": 1}]
+    _post(base + "/api/pairs", {"pairs": ["nl+en", "en+es"]}, cookie)
+
+    hits = json.loads(_get(base + "/api/search?q=koff", cookie)[2])["results"]
+    assert hits == [{"ratingKey": "101", "type": "movie", "title": "Koffie", "year": "2024"}]
+
+    d = json.loads(_get(base + "/api/title?rk=101", cookie)[2])
+    item = d["items"][0]
+    assert item["languages"] == ["en", "nl"] and item["image_only"] == []
+    assert item["pairs"]["nl+en"]["status"] == "ready"
+    assert item["pairs"]["en+es"] == {"status": "missing", "missing": ["es"], "searched": {}}
+    assert d["downloads_needed"] == 1 and d["downloads_left"] == 50
+    assert plex.uploads == [] and not plex.searches  # checking changes nothing
+
+    # "Make tracks": no fetching, so only nl+en is made.
+    code, out = _post(base + "/api/repair", {"key": "101", "title": "Koffie", "fetch": False}, cookie)
+    assert code == 200
+    job = _wait_job(base, cookie)
+    assert job["state"] == "finished" and job["counts"].get("added") == 1 and not plex.searches
+
+    # "Repair": fetches Spanish, then makes en+es.
+    _post(base + "/api/repair", {"key": "101", "title": "Koffie", "fetch": True}, cookie)
+    job = _wait_job(base, cookie)
+    assert job["counts"].get("added") == 1 and plex.searches == [("101", "es")]
+    d = json.loads(_get(base + "/api/title?rk=101", cookie)[2])
+    assert {k: v["status"] for k, v in d["items"][0]["pairs"].items()} == {"nl+en": "done", "en+es": "done"}
+    assert d["items"][0]["languages"] == ["en", "es", "nl"]
+
+
+@needs_ffmpeg
+def test_repair_skips_items_another_process_holds(plex, portal):  # noqa: F811
+    base, key = portal
+    cookie = f"dualsubs_key={key}"
+    import subprocess
+    import sys
+    import time
+
+    # A library run in another process is working on item 101 right now.
+    code = ("import sys,time; sys.path.insert(0, %r); from dualsubs.pipeline import State, item_lock; "
+            "l = item_lock(State(%r), '101'); assert l.__enter__(); print('held', flush=True); time.sleep(30)"
+            % (str(__import__('pathlib').Path(__file__).parents[1]), str(cli.config_dir() / "state.json")))
+    holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        _post(base + "/api/repair", {"key": "101", "title": "Koffie", "fetch": False}, cookie)
+        job = _wait_job(base, cookie)
+        assert job["counts"] == {"busy": 1} and plex.uploads == []
+    finally:
+        holder.kill()
+    time.sleep(0.2)
+    _post(base + "/api/repair", {"key": "101", "title": "Koffie", "fetch": False}, cookie)
+    assert _wait_job(base, cookie)["counts"] == {"added": 1}

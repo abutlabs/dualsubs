@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from . import __version__, plex as plexmod
 from .align import Style, merge
-from .pipeline import Settings, State, looks_like_key, pair_label, process_item, remove_item
+from .pipeline import Settings, State, compatibility, looks_like_key, pair_label, process_item, remove_item
 from .plex import Plex, PlexError
 from .progress import Progress
 from .subtitles import parse, write_srt
@@ -296,7 +296,10 @@ def cmd_doctor(args):
             line(True, "Plex", f"'{info['name']}' (Plex {info['version']}) at {plex.url}")
             libs = plex.libraries()
             line(bool(libs), "libraries", ", ".join(lib["title"] for lib in libs) or "none visible")
-            line(True, "language pairs", ", ".join(pair_label(p) for p in settings.pairs))
+            mirrored = [p for p in settings.pairs if (p[1], p[0]) in settings.pairs and p[0] < p[1]]
+            line(None if mirrored else True, "language pairs", ", ".join(pair_label(p) for p in settings.pairs)
+                 + "".join(f"; {pair_label(p)} and {pair_label(p[::-1])} are the same two languages swapped, "
+                           "you probably want only one" for p in mirrored))
         except (PlexError, OSError) as e:
             line(False, "Plex", str(e))
     print("All good." if ok else "Some checks failed; see above.")
@@ -320,6 +323,39 @@ def cmd_inspect(args):
             kind = "external" if s.external else f"embedded #{s.index}"
             flags = " ".join(f for f, on in (("forced", s.forced), ("SDH", s.hearing_impaired), ("image", not s.is_text)) if on)
             print(f"    [{s.id}] {s.raw_language or '?':<4} {s.codec:<8} {kind:<12} {flags:<14} {s.display or s.title}")
+
+
+def cmd_check(args):
+    """Show, without changing anything, what each pair can do for a title."""
+    plex, settings, state = build(args)
+    keys = resolve_targets(plex, args.target)
+    labels = [pair_label(p) for p in settings.pairs]
+    print(f"{'':<46}" + "".join(f"{lab:<16}" for lab in labels) + "subtitles")
+    totals = {lab: {} for lab in labels}
+    for k in keys:
+        try:
+            info = compatibility(plex.item(k), settings, state)
+        except PlexError as e:
+            print(f"{k}: {e}")
+            continue
+        cells = []
+        for pair, lab in zip(settings.pairs, labels):
+            x = info["pairs"]["+".join(pair)]
+            totals[lab][x["status"]] = totals[lab].get(x["status"], 0) + 1
+            cell = {"done": "done", "ready": "ready"}.get(x["status"], x["status"])
+            if x["status"] == "missing":
+                cell = "no " + "+".join(x["missing"])
+                if any(v == "none" for v in x["searched"].values()):
+                    cell += " (none found)"
+            cells.append(f"{cell:<16}")
+        langs = ",".join(info["languages"]) + (f" (image: {','.join(info['image_only'])})" if info["image_only"] else "")
+        title = info["title"] if len(info["title"]) <= 44 else info["title"][:43] + "…"
+        print(f"{title:<46}" + "".join(cells) + (langs or "none"))
+    print()
+    for lab, counts in totals.items():
+        print(f"{lab}: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+    print("\n'ready' items get their track on the next run. For 'no xx', "
+          "`dualsubs add <title> --fetch-missing` searches Plex's subtitle provider for the missing language.")
 
 
 def cmd_add(args):
@@ -406,6 +442,78 @@ def cmd_web(args):
         srv.server_close()
 
 
+def cmd_ui(args):
+    """On your own computer: tunnel to the Plex server, start `dualsubs web` there, open the browser."""
+    import re
+    import signal
+    import socket
+    import subprocess
+    import webbrowser
+
+    def free_port() -> int:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    lport = args.local_port or free_port()
+    rport = args.remote_port
+    for _attempt in range(8):
+        remote = f"{args.remote_cmd} web --port {rport}"
+        cmd = ["ssh", "-tt", "-o", "ExitOnForwardFailure=yes", "-L", f"{lport}:127.0.0.1:{rport}", args.host, remote]
+        print(f"Connecting to {args.host}...", flush=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                text=True, bufsize=1, start_new_session=True)
+        seen, key, busy = [], None, False
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            seen.append(line)
+            m = re.search(r"\?key=([\w-]+)", line)
+            if m:
+                key = m.group(1)
+                break
+            if "can't listen" in line:
+                busy = True
+                break
+        if key:
+            url = f"http://localhost:{lport}/?key={key}"
+            print(f"dualsubs is open at {url}\n(Ctrl-C to close it)", flush=True)
+            if not args.no_browser:
+                webbrowser.open(url)
+            try:
+                for _ in proc.stdout:  # keep draining so the remote side never blocks
+                    pass
+                proc.wait()
+                print("The connection to the server closed.")
+                return 1
+            except KeyboardInterrupt:
+                print("\nClosing.")
+                return 0
+            finally:
+                _stop(proc, signal)
+        _stop(proc, signal)
+        if busy:
+            rport += 1  # someone else on the server uses that port: try the next one
+            continue
+        print("\n".join(seen[-15:]))
+        hint = ("Is dualsubs installed on the server? Pass its path with --remote-cmd."
+                if any("not found" in s or "No such file" in s for s in seen) else
+                "Check that `ssh " + args.host + "` works on its own.")
+        sys.exit(f"Couldn't start dualsubs web on {args.host}. {hint}")
+    sys.exit(f"No free port on {args.host} between {args.remote_port} and {rport}; pass --remote-port.")
+
+
+def _stop(proc, signal) -> None:
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)  # ssh and anything it started locally
+        except OSError:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+
+
 def cmd_merge(args):
     a = parse(Path(args.primary_file).read_bytes(), Path(args.primary_file).suffix[1:])
     b = parse(Path(args.secondary_file).read_bytes(), Path(args.secondary_file).suffix[1:])
@@ -470,6 +578,10 @@ def main(argv=None):
     s.add_argument("--limit", type=int, default=20)
     s.set_defaults(fn=cmd_inspect)
 
+    s = sub.add_parser("check", parents=[work], help="show what each pair can do for a title; changes nothing")
+    s.add_argument("target", help="title, ratingKey, library:NAME or all")
+    s.set_defaults(fn=cmd_check)
+
     s = sub.add_parser("add", parents=[work], help="add bilingual tracks to a movie, show, season or library")
     s.add_argument("target", help="title, ratingKey, library:NAME or all")
     s.add_argument("--save", metavar="FILE.srt", help="also save the merged subtitles locally (single item)")
@@ -494,6 +606,16 @@ def main(argv=None):
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--host", default="127.0.0.1", help="address to listen on (default: this machine only)")
     s.set_defaults(fn=cmd_web)
+
+    s = sub.add_parser("ui", help="on your computer: open the server's status page through SSH",
+                       description="Run this on your own computer. It connects to HOST over SSH, starts "
+                                   "`dualsubs web` there, tunnels it and opens your browser.")
+    s.add_argument("host", help="your SSH shortcut for the Plex server, e.g. plex-server")
+    s.add_argument("--remote-cmd", default="~/.local/bin/dualsubs", help="dualsubs on the server (default %(default)s)")
+    s.add_argument("--remote-port", type=int, default=8765, help="port on the server (tries the next ones if taken)")
+    s.add_argument("--local-port", type=int, help="port on this computer (default: any free one)")
+    s.add_argument("--no-browser", action="store_true", help="just print the link")
+    s.set_defaults(fn=cmd_ui)
 
     s = sub.add_parser("merge", parents=[style], help="merge two subtitle files offline (no Plex)")
     s.add_argument("primary_file")
