@@ -44,9 +44,10 @@ only English). To fill those gaps, see [Fetching missing subtitles](#fetching-mi
 
 dualsubs runs **on your Plex server**: a seedbox, NAS or home server. It has to
 run there because subtitles are often embedded inside the video files, and
-those only exist on that machine. You don't need root or Docker. The server
-needs Python 3.9+, git, and ffmpeg (or Plex's own transcoder, which dualsubs
-uses automatically when ffmpeg is missing).
+those only exist on that machine. You don't need root or Docker, and dualsubs
+has no dependencies beyond Python itself. The server needs Python 3.9+ and
+ffmpeg (or Plex's own transcoder, which dualsubs uses automatically when ffmpeg
+is missing).
 
 You install and run it from your own computer over SSH, so you never have to
 work on the server directly.
@@ -86,13 +87,35 @@ use that instead.
 
 ### 2. Install dualsubs on the server
 
+Pick one. Both put the command at `~/.local/bin/dualsubs`, so the rest of this
+guide is the same either way.
+
+**Option A: pre-built (recommended).** This is one small file from the
+[latest release](https://github.com/abutlabs/dualsubs/releases/latest). It runs
+on any Linux or macOS server with Python 3.9+ and needs nothing else installed.
+
+```bash
+ssh plex-server 'mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/dualsubs https://github.com/abutlabs/dualsubs/releases/latest/download/dualsubs && chmod +x ~/.local/bin/dualsubs'
+```
+
+(No `curl`? Use `wget -qO ~/.local/bin/dualsubs https://github.com/abutlabs/dualsubs/releases/latest/download/dualsubs` instead.)
+
+**Option B: from source.** Use this if you want to follow `main` or change the code.
+
 ```bash
 ssh plex-server 'git clone https://github.com/abutlabs/dualsubs.git ~/dualsubs && ~/dualsubs/install.sh'
 ```
 
-The installer puts dualsubs in your home folder (`~/.local/share/dualsubs`, with
-the command at `~/.local/bin/dualsubs`). It also checks for ffmpeg and tells you
-if anything is missing.
+This installs into `~/.local/share/dualsubs`.
+
+Then check that the server has everything:
+
+```bash
+ssh plex-server '~/.local/bin/dualsubs doctor'
+```
+
+It reports the Python version, which ffmpeg it will use, and whether low-priority
+mode is available. After step 3 it also checks the Plex connection.
 
 ### 3. Connect it to Plex and choose your languages
 
@@ -194,9 +217,20 @@ minutes, for example in tmux. That stops if the server reboots.)
 
 ### Update
 
+Run the same command you installed with. For the pre-built file:
+
+```bash
+ssh plex-server 'curl -fsSL -o ~/.local/bin/dualsubs https://github.com/abutlabs/dualsubs/releases/latest/download/dualsubs && chmod +x ~/.local/bin/dualsubs && ~/.local/bin/dualsubs --version'
+```
+
+From source:
+
 ```bash
 ssh plex-server 'cd ~/dualsubs && git pull && ./install.sh'
 ```
+
+Your settings, language pairs and progress are kept in `~/.config/dualsubs/`,
+separate from the program, so updating never resets them.
 
 Cron picks up the new version on its next run. A run in tmux keeps using the
 old version until restarted. Stopping it is safe, because finished items are
@@ -216,8 +250,15 @@ ssh plex-server 'tmux kill-session -t dualsubs 2>/dev/null; rm -rf ~/dualsubs ~/
 
 ### Running it directly on the Plex machine
 
-Clone the repo, run `./install.sh` and use `dualsubs ...` without the `ssh`
-prefix. `dualsubs login` works the same way.
+Run the install command from step 2 without the `ssh plex-server '...'` wrapper,
+then use `dualsubs ...` directly. `dualsubs login` works the same way.
+
+### Builds and releases
+
+Every push to `main` is tested on Python 3.9 to 3.13 and published as the
+single-file **edge** pre-release. A new version number on `main` also creates a
+regular release, which is what the download link in step 2 points to. To build
+the file yourself, run `./scripts/build-pyz.sh`; the result is `dist/dualsubs`.
 
 ## Language pairs
 

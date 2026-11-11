@@ -1,0 +1,61 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # publish releases
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get update -q && sudo apt-get install -yq ffmpeg
+      - run: pip install pytest
+      - run: python -m pytest -q
+
+  release:
+    # Builds the single-file `dualsubs` and publishes it:
+    #  - "edge": rolling pre-release from every push to main
+    #  - "vX.Y.Z": a normal release the first time a new version reaches main
+    #    (this is what .../releases/latest/download/dualsubs serves)
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"  # build with the oldest supported Python
+      - run: ./scripts/build-pyz.sh
+      - name: Smoke test
+        run: ./dist/dualsubs --version && ./dist/dualsubs --help >/dev/null
+      - name: Publish edge build
+        run: |
+          git tag -f edge && git push -f origin edge
+          notes="Rolling build of main at ${GITHUB_SHA::7}. For a stable version use the latest release."
+          gh release view edge >/dev/null 2>&1 \
+            || gh release create edge --prerelease --title "Edge (latest main)" --notes "$notes"
+          gh release edit edge --notes "$notes"
+          gh release upload edge dist/dualsubs --clobber
+      - name: Publish version release
+        run: |
+          version=$(python3 -c "import re;print(re.search(r'__version__ = \"(.+?)\"', open('dualsubs/__init__.py').read()).group(1))")
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "v$version already released"
+          else
+            gh release create "v$version" dist/dualsubs --target "$GITHUB_SHA" --latest \
+              --title "dualsubs $version" --generate-notes
+          fi

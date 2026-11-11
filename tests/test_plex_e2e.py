@@ -285,7 +285,7 @@ def test_pauses_while_someone_is_watching(plex, monkeypatch, capsys):
         slept.append(s)
         plex.sessions = ["paused"]  # the viewer stops; a paused session must not block
 
-    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli.StreamGate, "sleep", staticmethod(fake_sleep))
     monkeypatch.setattr(cli.StreamGate, "CACHE_S", -1)  # ask Plex every time
     assert main(["add", "101"]) == 0
     out = capsys.readouterr().out
@@ -423,3 +423,9 @@ def test_enabling_fetch_missing_reopens_missing_items(plex, capsys):
     plex.catalog[("101", "es")] = [{"key": "/os/es-1", "text": ES.encode()}]
     main(["add", "101", "--pair", "en+es", "--fetch-missing"])
     assert "[EN+ES]: added" in capsys.readouterr().out
+
+
+def test_doctor(plex, capsys):
+    assert main(["doctor"]) in (0, 1)
+    out = capsys.readouterr().out
+    assert "[ok  ] Python" in out and "'FakePlex'" in out and "Movies" in out and "NL+EN" in out

@@ -155,6 +155,10 @@ class StreamGate:
         self.plex, self.enabled = plex, enabled
         self._checked, self._count = 0.0, 0
 
+    @staticmethod
+    def sleep(seconds: float) -> None:
+        time.sleep(seconds)
+
     def playing(self) -> int:
         if not self.enabled:
             return 0
@@ -174,7 +178,7 @@ class StreamGate:
         print(time.strftime("%Y-%m-%d %H:%M ") + f"paused: {self._count} Plex stream(s) playing; "
               "continuing when they stop", flush=True)
         while self.playing():
-            time.sleep(self.POLL)
+            self.sleep(self.POLL)
         print(time.strftime("%Y-%m-%d %H:%M ") + f"resumed after {int(time.time() - since) // 60} min", flush=True)
 
 
@@ -236,6 +240,47 @@ def cmd_login(args):
     cfg.update({"url": url, "token": srv["token"]})
     path = save_config(cfg)
     print(f"Connected to '{info['name']}' (Plex {info['version']}) at {url}\nSaved to {path}")
+
+
+def cmd_doctor(args):
+    """Check everything dualsubs needs on this machine, and the Plex connection."""
+    import platform
+    import shutil
+
+    ok = True
+
+    def line(good, label, detail=""):
+        nonlocal ok
+        ok &= bool(good) or good is None
+        mark = "ok  " if good else ("--  " if good is None else "FAIL")
+        print(f"[{mark}] {label}" + (f": {detail}" if detail else ""))
+
+    line(sys.version_info >= (3, 9), "Python", f"{platform.python_version()} ({sys.executable})")
+    try:
+        line(True, "ffmpeg", plexmod.find_ffmpeg() + " (for subtitles inside video files)")
+    except PlexError as e:
+        line(False, "ffmpeg", str(e))
+    tools = [t for t in ("nice", "ionice") if shutil.which(t)]
+    line(True if tools else None, "low-priority tools", ", ".join(tools) or "none; ffmpeg runs at normal priority")
+    cfg = load_config()
+    path = config_dir() / "config.json"
+    if not (cfg.get("url") or os.environ.get("PLEX_URL")):
+        line(False, "Plex connection", f"not set up; run `dualsubs login` (config: {path})")
+    else:
+        if path.exists():
+            mode = path.stat().st_mode & 0o777
+            line(mode == 0o600, "config file", f"{path} (mode {mode:o})")
+        try:
+            plex, settings, _ = build(args)
+            info = plex.identity()
+            line(True, "Plex", f"'{info['name']}' (Plex {info['version']}) at {plex.url}")
+            libs = plex.libraries()
+            line(bool(libs), "libraries", ", ".join(lib["title"] for lib in libs) or "none visible")
+            line(True, "language pairs", ", ".join(pair_label(p) for p in settings.pairs))
+        except (PlexError, OSError) as e:
+            line(False, "Plex", str(e))
+    print("All good." if ok else "Some checks failed; see above.")
+    return 0 if ok else 1
 
 
 def cmd_libraries(args):
@@ -360,6 +405,9 @@ def main(argv=None):
     s.add_argument("--server", help="server name, if your account has several")
     s.set_defaults(fn=cmd_login)
 
+    s = sub.add_parser("doctor", parents=[conn], help="check this machine and the Plex connection")
+    s.set_defaults(fn=cmd_doctor)
+
     s = sub.add_parser("libraries", parents=[conn], help="list movie and TV libraries")
     s.set_defaults(fn=cmd_libraries)
 
@@ -403,6 +451,11 @@ def main(argv=None):
         sys.exit(f"error: {e}")
     except KeyboardInterrupt:
         return 130
+
+
+def run() -> None:
+    """Entry point for the single-file build (zipapp ignores main()'s return value)."""
+    sys.exit(main())
 
 
 if __name__ == "__main__":

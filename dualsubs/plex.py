@@ -21,9 +21,9 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
-import requests
 
 from . import __version__
+from .http import Response, Session
 from .languages import normalize
 
 TEXT_CODECS = {"srt", "subrip", "ass", "ssa", "mov_text", "webvtt", "vtt", "text", "smi"}
@@ -81,11 +81,11 @@ def _b(v: str | None) -> bool:
 
 
 class Plex:
-    def __init__(self, url: str, token: str, session: requests.Session | None = None, timeout: int = 30):
+    def __init__(self, url: str, token: str, session: Session | None = None, timeout: int = 30):
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
-        self.s = session or requests.Session()
+        self.s = session or Session()
         self.s.headers.update({
             "X-Plex-Token": token,
             "X-Plex-Product": "dualsubs",
@@ -95,8 +95,11 @@ class Plex:
         })
 
     # ------------------------------------------------------------------ http
-    def _req(self, method: str, path: str, **kw) -> requests.Response:
-        r = self.s.request(method, self.url + path, timeout=self.timeout, **kw)
+    def _req(self, method: str, path: str, **kw) -> Response:
+        try:
+            r = self.s.request(method, self.url + path, timeout=self.timeout, **kw)
+        except OSError as e:  # connection refused, DNS, timeout
+            raise PlexError(f"can't reach Plex at {self.url}: {e}") from e
         if r.status_code == 401:
             raise PlexError("Plex rejected the token (401). Run `dualsubs login` or check PLEX_TOKEN.")
         if r.status_code == 403 and method != "GET":
@@ -364,9 +367,9 @@ def _client_id() -> str:
     return "dualsubs-" + uuid.uuid5(uuid.NAMESPACE_DNS, uuid.getnode().__str__()).hex[:12]
 
 
-def login_pin(session: requests.Session | None = None, poll: float = 2.0, timeout: float = 300, out=None) -> str:
+def login_pin(session: Session | None = None, poll: float = 2.0, timeout: float = 300, out=None) -> str:
     """Sign in through app.plex.tv in a browser and return an auth token."""
-    s = session or requests.Session()
+    s = session or Session()
     out = out or (lambda msg: print(msg, flush=True))  # flush: often run over ssh
     cid = _client_id()
     headers = {"Accept": "application/json", "X-Plex-Product": "dualsubs", "X-Plex-Client-Identifier": cid}
@@ -385,9 +388,9 @@ def login_pin(session: requests.Session | None = None, poll: float = 2.0, timeou
     raise PlexError("Timed out waiting for Plex sign-in")
 
 
-def discover_servers(token: str, session: requests.Session | None = None) -> list[dict]:
+def discover_servers(token: str, session: Session | None = None) -> list[dict]:
     """Servers on the account, with their connection URLs (local ones first)."""
-    s = session or requests.Session()
+    s = session or Session()
     r = s.get(
         f"{PLEX_TV}/api/v2/resources",
         params={"includeHttps": "1", "includeRelay": "0"},
