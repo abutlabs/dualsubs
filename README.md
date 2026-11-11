@@ -94,7 +94,8 @@ ssh -t plex-server '~/.local/bin/dualsubs login'
 ```
 
 This prints a link. Open it in the browser on your computer, sign in to Plex
-and approve dualsubs. It then finds your server and saves the connection on the
+**with the account that owns the server** and approve dualsubs. (Plex lets a
+shared or managed user watch, but not add subtitles: uploads fail with 403.) It then finds your server and saves the connection on the
 server in `~/.config/dualsubs/config.json`, readable only by you. Check it worked:
 
 ```bash
@@ -120,13 +121,33 @@ ssh plex-server '~/.local/bin/dualsubs add "<a show or movie>"'            # do 
 
 Play it on your TV and pick the dualsubs track.
 
+### Streaming and seeding come first
+
+dualsubs is a background job, and it behaves like one by default:
+
+- **It pauses while anyone is watching.** Before each item it asks Plex whether
+  something is playing. If so, it waits (checking every minute) and logs
+  `paused: 1 Plex stream(s) playing`. Paused playback doesn't count, so a film
+  left paused overnight won't stall it. A cron run (`watch --once`) doesn't
+  wait; it skips and tries again next time.
+- **It reads video files at the lowest priority.** ffmpeg runs under
+  `nice -n 19` and the lowest best-effort disk priority (`ionice -c2 -n7`), so
+  Plex and your torrent client get the CPU and disk first. On a box that's
+  always busy seeding, `--priority idle` goes further: it only reads when nothing
+  else wants the disk. That's slower, but it never competes with seeding.
+- **It reads each video file once.** To get subtitles that are embedded in a
+  video, ffmpeg has to read through the whole file. dualsubs pulls every track it
+  needs from a file in a single pass, however many language pairs you have.
+
+To make it run at full speed instead, use `--priority normal --ignore-streams`,
+or set `"priority"` / `"yield_to_streams": false` in the config.
+
 ### 5. Fill in your existing library
 
-Do this **one library at a time**. To read subtitles that are embedded in a
-video, ffmpeg has to read through the whole video file. dualsubs only reads
-each file once, however many tracks and pairs it needs from it, but the first
-pass over a large library is still a lot of disk reading. Run it in tmux so it
-keeps going after you disconnect, and log the output:
+Do this **one library at a time**. Even with the measures above, the first pass
+over a large library is a lot of disk reading. Expect it to take a day or more
+for thousands of episodes, and longer when it keeps pausing for viewers. Run it
+in tmux so it keeps going after you disconnect, and log the output:
 
 ```bash
 ssh plex-server 'tmux new -d -s dualsubs "~/.local/bin/dualsubs add library:<Name> >> ~/dualsubs.log 2>&1"'
@@ -148,9 +169,9 @@ and add:
 
 `watch --once` only looks at recently added items, so each run is quick. Use it
 rather than `scan`, which checks every item every time. Only one dualsubs run
-works at a time. If cron fires while a long run from step 5 is still going, it
-logs "skipped" and tries again next time, so the two never overwrite each
-other's progress.
+works at a time. If cron fires while a long run from step 5 is still going, or
+while someone is watching, it logs "skipped" and tries again next time. You
+don't need `flock` or `nice` in the cron line; dualsubs handles both itself.
 
 (If cron isn't available, `dualsubs watch` keeps running and checks every 10
 minutes, for example in tmux. That stops if the server reboots.)
@@ -235,15 +256,16 @@ For example, when Plex runs in Docker: `--path-map /data/media=/home/me/media`
 
 ## Status
 
-This is a prototype, built and tested against a simulated Plex server and real
-ffmpeg-made `.mkv` files. Still to confirm on a real server:
+This is an early version. It has been tested against a simulated Plex server
+and real ffmpeg-made `.mkv` files, and run on a real seedbox Plex with the
+tracks played on Android TV (NVIDIA Shield). Still open:
 
 - how Plex labels the uploaded track in its subtitle menu. With several pairs
   that share a main language (EN+ES, EN+FR), the label must show the track's
   title, not just "English", to tell them apart. If it doesn't, change the
   `filename` template in the config;
-- that the Plex app on Android TV renders the coloured second line. If it
-  doesn't, use `--color none --italic`;
+- whether every Plex app shows the second line in colour. If one doesn't,
+  use `--color none --italic`;
 - `--mode sidecar` (writes a `.srt` next to the video instead of uploading).
 
 ## Development

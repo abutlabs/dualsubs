@@ -20,6 +20,8 @@ class FakePlex:
         self.next_id = 9000
         self.uploads: list[dict] = []
         self.requests: list[str] = []
+        self.sessions: list[str] = []  # player states, e.g. ["playing", "paused"]
+        self.deny_writes = False  # behave like a shared (non-owner) user
 
     def add_movie(self, rk, title, file, streams, year="2024"):
         self.items[rk] = {"title": title, "type": "movie", "file": file, "part_id": int(rk) + 1000,
@@ -47,6 +49,11 @@ class FakePlex:
         self.requests.append(f"{method} {path}")
         if path == "/":
             return 200, '<MediaContainer friendlyName="FakePlex" version="1.41.0" machineIdentifier="fake-machine"/>'
+        if path == "/status/sessions":
+            vids = "".join(f'<Video type="episode"><Player state="{s}"/></Video>' for s in self.sessions)
+            return 200, f'<MediaContainer size="{len(self.sessions)}">{vids}</MediaContainer>'
+        if self.deny_writes and method != "GET":
+            return 403, "Forbidden"
         if path == "/library/sections":
             return 200, '<MediaContainer><Directory key="1" type="movie" title="Movies"/></MediaContainer>'
         if path == "/library/sections/1/all" or path == "/library/recentlyAdded":

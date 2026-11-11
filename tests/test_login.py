@@ -27,7 +27,7 @@ class FakeSession:
         assert url.endswith("/api/v2/resources")
         return Resp([
             {"name": "Phone", "provides": "client,player", "connections": []},
-            {"name": "seedhost", "clientIdentifier": "abc", "provides": "server", "accessToken": "SRVTOKEN", "connections": [
+            {"name": "seedhost", "clientIdentifier": "abc", "owned": True, "provides": "server", "accessToken": "SRVTOKEN", "connections": [
                 {"uri": "https://1-2-3-4.abc.plex.direct:32400", "local": False, "relay": False},
                 {"uri": "http://10.0.0.5:32400", "local": True, "relay": False},
             ]},
@@ -40,7 +40,7 @@ def test_login_and_discover():
     assert login_pin(session=s, poll=0, out=shown.append) == "TOKEN"
     assert "app.plex.tv/auth#?" in shown[0] and "code=abc123" in shown[0]
     servers = discover_servers("TOKEN", session=s)
-    assert servers == [{"name": "seedhost", "id": "abc", "token": "SRVTOKEN",
+    assert servers == [{"name": "seedhost", "id": "abc", "owned": True, "token": "SRVTOKEN",
                         "urls": ["http://10.0.0.5:32400", "https://1-2-3-4.abc.plex.direct:32400"]}]
 
 

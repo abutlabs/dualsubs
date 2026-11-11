@@ -272,3 +272,61 @@ def test_remove_all_uses_state(plex, capsys):
     main(["remove", "all"])
     assert not [s for s in plex.items["101"]["streams"] if "dualsubs" in s.get("title", "")]
     assert "GET /library/sections" not in plex.requests  # no full-library walk
+
+
+@needs_ffmpeg
+def test_pauses_while_someone_is_watching(plex, monkeypatch, capsys):
+    from dualsubs import cli
+
+    plex.sessions = ["playing", "paused"]
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(s)
+        plex.sessions = ["paused"]  # the viewer stops; a paused session must not block
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli.StreamGate, "CACHE_S", -1)  # ask Plex every time
+    assert main(["add", "101"]) == 0
+    out = capsys.readouterr().out
+    assert "paused: 1 Plex stream(s) playing" in out and "resumed" in out
+    assert slept == [60] and len(plex.uploads) == 1
+
+
+@needs_ffmpeg
+def test_cron_run_skips_while_streaming_and_ignore_flag(plex, capsys):
+    plex.sessions = ["playing"]
+    assert main(["watch", "--once"]) == 0
+    assert "skipped: 1 Plex stream(s) playing" in capsys.readouterr().out
+    assert plex.uploads == []
+    assert main(["add", "101", "--ignore-streams"]) == 0
+    assert len(plex.uploads) == 1
+
+
+@needs_ffmpeg
+def test_ffmpeg_runs_at_low_priority(plex, monkeypatch):
+    import shutil
+    import subprocess as sp
+    from dualsubs import plex as plexmod
+
+    calls = []
+    real_run = sp.run
+    monkeypatch.setattr(plexmod.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd) or real_run(cmd, *a, **kw))
+    main(["add", "101"])
+    expected = (["nice", "-n", "19"] if shutil.which("nice") else []) + (
+        ["ionice", "-c", "2", "-n", "7"] if shutil.which("ionice") else [])
+    assert calls[0][: len(expected)] == expected
+    calls.clear()
+    main(["add", "101", "--force", "--priority", "idle"])
+    if shutil.which("ionice"):
+        assert ["ionice", "-c", "3"] == calls[0][3:6]
+    calls.clear()
+    main(["add", "101", "--force", "--priority", "normal"])
+    assert "nice" not in calls[0][0]
+
+
+def test_shared_user_gets_clear_403(plex, capsys):
+    plex.deny_writes = True
+    main(["add", "101", "--ignore-streams", "--pair", "en+es"])
+    out = capsys.readouterr().out
+    assert "needs the server OWNER" in out

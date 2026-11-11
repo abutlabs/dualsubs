@@ -61,6 +61,16 @@ def build(args, lock: bool = False):
     ff = _opt(args, "ffmpeg", "DUALSUBS_FFMPEG", cfg)
     if ff:
         plexmod.FFMPEG = ff
+    plexmod.PRIORITY = _opt(args, "priority", "DUALSUBS_PRIORITY", cfg, "low")
+    if plexmod.PRIORITY not in ("low", "idle", "normal"):
+        sys.exit(f"--priority must be low, idle or normal, not {plexmod.PRIORITY!r}")
+    args._yield = not getattr(args, "ignore_streams", False) and cfg.get("yield_to_streams", True) \
+        and os.environ.get("DUALSUBS_YIELD_TO_STREAMS", "1") != "0"
+    if lock and plexmod.PRIORITY != "normal":
+        try:
+            os.nice(19 - os.nice(0))  # background job: this process too, not just ffmpeg
+        except OSError:
+            pass
     settings = Settings(
         pairs=pairs_from(args, cfg),
         style=style_from(args, cfg),
@@ -127,9 +137,48 @@ def resolve_targets(plex: Plex, target: str) -> list[str]:
     sys.exit(2)
 
 
+class StreamGate:
+    """Holds dualsubs back while anyone is watching something on Plex."""
+
+    POLL = 60  # seconds between checks while paused
+    CACHE_S = 30  # re-ask Plex at most this often
+
+    def __init__(self, plex: Plex, enabled: bool):
+        self.plex, self.enabled = plex, enabled
+        self._checked, self._count = 0.0, 0
+
+    def playing(self) -> int:
+        if not self.enabled:
+            return 0
+        if time.time() - self._checked > self.CACHE_S:
+            try:
+                self._count = self.plex.playing_sessions()
+            except PlexError as e:
+                print(f"note: can't see Plex sessions ({e}); not pausing for streams", flush=True)
+                self.enabled, self._count = False, 0
+            self._checked = time.time()
+        return self._count
+
+    def wait(self) -> None:
+        if not self.playing():
+            return
+        since = time.time()
+        print(time.strftime("%Y-%m-%d %H:%M ") + f"paused: {self._count} Plex stream(s) playing; "
+              "continuing when they stop", flush=True)
+        while self.playing():
+            time.sleep(self.POLL)
+        print(time.strftime("%Y-%m-%d %H:%M ") + f"resumed after {int(time.time() - since) // 60} min", flush=True)
+
+
+def settings_yield(args) -> bool:
+    return getattr(args, "_yield", True)
+
+
 def run_items(plex, settings, state, keys, args) -> int:
     counts: dict[str, int] = {}
+    gate = StreamGate(plex, settings_yield(args) and not args.dry_run)
     for k in keys:
+        gate.wait()
         for res in process_item(plex, k, settings, state, dry_run=args.dry_run, force=args.force,
                                 save_to=getattr(args, "save", None)):
             counts[res.status] = counts.get(res.status, 0) + 1
@@ -171,6 +220,9 @@ def cmd_login(args):
         names = ", ".join(s["name"] for s in servers)
         sys.exit(f"Signed in, but couldn't reach a server from here (found: {names}). Pass --url manually.")
     srv, url, info = chosen
+    if not srv.get("owned", True):
+        print(f"warning: you don't own '{srv['name']}'; Plex only lets the owner's account add subtitles. "
+              "Sign in with the server owner's Plex account instead.", flush=True)
     cfg = load_config()
     cfg.update({"url": url, "token": srv["token"]})
     path = save_config(cfg)
@@ -225,10 +277,16 @@ def cmd_watch(args):
     print(f"Watching for new items every {args.interval}s ({labels}). Ctrl-C to stop.", flush=True)
     if args.initial_scan:
         run_items(plex, settings, state, resolve_targets(plex, "all"), args)
+    gate = StreamGate(plex, settings_yield(args))
     while True:
         try:
+            if args.once and gate.playing():
+                # From cron: just try again next time rather than wait.
+                print(time.strftime("%Y-%m-%d %H:%M ") + f"skipped: {gate.playing()} Plex stream(s) playing", flush=True)
+                return 0
             keys = plex.recently_added(args.batch)
             for k in keys:
+                gate.wait()
                 for res in process_item(plex, k, settings, state):
                     if res.status != "up-to-date":
                         print(time.strftime("%Y-%m-%d %H:%M ") + res.line(), flush=True)
@@ -274,6 +332,11 @@ def main(argv=None):
     work.add_argument("--mode", choices=["upload", "sidecar"], help="upload into Plex (default) or write a .srt next to the video")
     work.add_argument("--path-map", action="append", metavar="PLEX_PATH=LOCAL_PATH", help="translate media paths if this machine mounts them elsewhere")
     work.add_argument("--ffmpeg", help="path to ffmpeg (or Plex's 'Plex Transcoder')")
+    work.add_argument("--priority", choices=["low", "idle", "normal"],
+                      help="CPU/disk priority for reading video files: low (default) yields to Plex and seeding, "
+                           "idle only reads when the disk is otherwise unused, normal is full speed")
+    work.add_argument("--ignore-streams", action="store_true",
+                      help="don't pause while someone is watching on Plex (default: pause)")
     work.add_argument("-n", "--dry-run", action="store_true", help="show what would happen, change nothing")
     work.add_argument("-f", "--force", action="store_true", help="redo items already done; add even when tracks barely line up")
     work.add_argument("-v", "--verbose", action="store_true")

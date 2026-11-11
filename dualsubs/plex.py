@@ -99,6 +99,10 @@ class Plex:
         r = self.s.request(method, self.url + path, timeout=self.timeout, **kw)
         if r.status_code == 401:
             raise PlexError("Plex rejected the token (401). Run `dualsubs login` or check PLEX_TOKEN.")
+        if r.status_code == 403 and method != "GET":
+            raise PlexError(
+                f"Plex refused {method} {path} (403). Adding subtitles needs the server OWNER's account; "
+                "a shared or managed user can watch but not change items. Run `dualsubs login` and sign in as the owner.")
         if r.status_code >= 400:
             raise PlexError(f"{method} {path} -> HTTP {r.status_code}: {r.text[:200]}")
         return r
@@ -110,6 +114,21 @@ class Plex:
     def identity(self) -> dict:
         root = self._xml("/")
         return {"name": root.get("friendlyName"), "version": root.get("version"), "id": root.get("machineIdentifier")}
+
+    def playing_sessions(self) -> int:
+        """How many people are actively watching or listening right now.
+
+        Paused sessions don't count: someone leaving a film paused overnight
+        shouldn't stall dualsubs.
+        """
+        root = self._xml("/status/sessions")
+        n = 0
+        for el in root:
+            player = el.find("Player")
+            state = player.get("state") if player is not None else "playing"
+            if state in ("playing", "buffering"):
+                n += 1
+        return n
 
     def libraries(self) -> list[dict]:
         return [
@@ -233,6 +252,25 @@ FFMPEG_CANDIDATES = [
     "/Applications/Plex Media Server.app/Contents/MacOS/Plex Transcoder",
 ]
 FFMPEG: str | None = None  # set from --ffmpeg / DUALSUBS_FFMPEG
+PRIORITY = "low"  # low | idle | normal: CPU and disk priority for ffmpeg
+
+
+def priority_prefix(level: str | None = None) -> list[str]:
+    """Command prefix that runs ffmpeg behind Plex streaming and seeding.
+
+    low:  nice 19 + best-effort lowest disk priority (still makes progress on a busy box)
+    idle: nice 19 + idle disk class (only reads when nothing else wants the disk)
+    """
+    import shutil
+    level = level or PRIORITY
+    if level == "normal":
+        return []
+    prefix = []
+    if shutil.which("nice"):
+        prefix += ["nice", "-n", "19"]
+    if shutil.which("ionice"):  # Linux only
+        prefix += ["ionice", "-c", "3"] if level == "idle" else ["ionice", "-c", "2", "-n", "7"]
+    return prefix
 
 
 def find_ffmpeg() -> str:
@@ -265,7 +303,7 @@ def extract_embedded_many(file: str, streams: list[tuple[int, str]]) -> dict[int
         # Plex's transcoder finds its codec libraries relative to its own folder.
         env["LD_LIBRARY_PATH"] = os.path.dirname(exe) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     with tempfile.TemporaryDirectory(prefix="dualsubs-") as tmp:
-        cmd = [exe, "-nostdin", "-v", "error", "-y", "-i", file]
+        cmd = priority_prefix() + [exe, "-nostdin", "-v", "error", "-y", "-i", file]
         outs = {}
         for index, codec in dict(streams).items():
             fmt = "ass" if codec in ("ass", "ssa") else "srt"
@@ -340,7 +378,9 @@ def discover_servers(token: str, session: requests.Session | None = None) -> lis
         servers.append({
             "name": res.get("name"),
             "id": res.get("clientIdentifier"),
+            "owned": bool(res.get("owned")),
             "token": res.get("accessToken") or token,
             "urls": [c["uri"] for c in conns],
         })
+    servers.sort(key=lambda s: not s["owned"])  # your own server first; shared ones can't take uploads
     return servers
