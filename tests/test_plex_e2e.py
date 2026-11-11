@@ -207,3 +207,68 @@ def test_pair_parsing():
     for bad in ("en", "en+en", "en+xx", "en+es+fr"):
         with pytest.raises(ValueError):
             parse_pair(bad)
+
+
+@needs_ffmpeg
+def test_one_ffmpeg_pass_per_file(plex, monkeypatch, tmp_path):
+    """Two pairs needing two different embedded tracks: the video file is read once."""
+    import subprocess as sp
+    from dualsubs import plex as plexmod
+
+    # Drop the external tracks so English must come from inside the .mkv too.
+    plex.items["101"]["streams"] = [s for s in plex.items["101"]["streams"] if "key" not in s]
+    calls = []
+    real_run = sp.run
+
+    def counting_run(cmd, *a, **kw):
+        calls.append(cmd)
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(plexmod.subprocess, "run", counting_run)
+    assert main(["add", "101", "--pair", "nl+en", "--pair", "en+nl"]) == 0
+    assert len(plex.uploads) == 2
+    assert len(calls) == 1 and calls[0].count("-map") == 2
+    # SDH English was the only English left, and it was used.
+    assert "KETTLE" in plex.uploads[0]["body"].decode()
+
+
+@needs_ffmpeg
+def test_second_run_is_refused_while_one_is_busy(plex, capsys, tmp_path):
+    from dualsubs.pipeline import State
+
+    holder = State(tmp_path / "home" / "state.json")
+    assert holder.lock()
+    with pytest.raises(SystemExit) as e:
+        main(["add", "101"])
+    assert "already working" in str(e.value)
+    with pytest.raises(SystemExit) as e:  # cron: quiet, successful exit
+        main(["watch", "--once"])
+    assert e.value.code == 0 and "skipped" in capsys.readouterr().out
+    assert main(["add", "101", "--dry-run"]) == 0  # previews still allowed
+    assert plex.uploads == []
+    holder._lock_file.close()
+    assert main(["add", "101"]) == 0 and len(plex.uploads) == 1
+
+
+def test_config_is_created_private(tmp_path, monkeypatch):
+    import os
+    import stat
+    from dualsubs.cli import save_config
+
+    monkeypatch.setenv("DUALSUBS_HOME", str(tmp_path / "cfg"))
+    old = os.umask(0o022)
+    try:
+        p = save_config({"token": "secret"})
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+@needs_ffmpeg
+def test_remove_all_uses_state(plex, capsys):
+    main(["add", "101", "--pair", "nl+en", "--pair", "en+nl"])
+    assert len([s for s in plex.items["101"]["streams"] if "dualsubs" in s.get("title", "")]) == 2
+    plex.requests.clear()
+    main(["remove", "all"])
+    assert not [s for s in plex.items["101"]["streams"] if "dualsubs" in s.get("title", "")]
+    assert "GET /library/sections" not in plex.requests  # no full-library walk

@@ -87,7 +87,7 @@ The installer puts dualsubs in your home folder (`~/.local/share/dualsubs`, with
 the command at `~/.local/bin/dualsubs`). It also checks for ffmpeg and tells you
 if anything is missing.
 
-### 3. Connect it to Plex
+### 3. Connect it to Plex and choose your languages
 
 ```bash
 ssh -t plex-server '~/.local/bin/dualsubs login'
@@ -101,27 +101,59 @@ server in `~/.config/dualsubs/config.json`, readable only by you. Check it worke
 ssh plex-server '~/.local/bin/dualsubs libraries'
 ```
 
-### 4. Try it on one show, then turn on automatic mode
+Then set your language pairs (see [Language pairs](#language-pairs)) **before
+the first real run**. Without this, the default is Dutch + English. Edit the
+config, keep the `url`/`token` lines that `login` wrote, and add a `pairs` line:
 
 ```bash
-ssh plex-server '~/.local/bin/dualsubs add "<a show or movie>" --dry-run'   # preview
-ssh plex-server '~/.local/bin/dualsubs add "<a show or movie>"'             # do it
+ssh -t plex-server 'nano ~/.config/dualsubs/config.json'
+#   "pairs": ["en+es"]
 ```
 
-Play it on your TV and pick the dualsubs track. If you're happy, have the server
-handle everything, including new episodes as they arrive:
+### 4. Try it on one title
 
 ```bash
-ssh plex-server 'tmux new -d -s dualsubs "~/.local/bin/dualsubs watch --initial-scan"'
+ssh plex-server '~/.local/bin/dualsubs inspect "<a show or movie>"'      # what's there
+ssh plex-server '~/.local/bin/dualsubs add "<a show or movie>" --dry-run'  # preview
+ssh plex-server '~/.local/bin/dualsubs add "<a show or movie>"'            # do it
 ```
 
-That keeps running after you disconnect. To look in on it, run
-`ssh -t plex-server 'tmux attach -t dualsubs'` and press Ctrl-B then D to leave.
-If your server has no tmux, use cron instead (`ssh -t plex-server 'crontab -e'`):
+Play it on your TV and pick the dualsubs track.
+
+### 5. Fill in your existing library
+
+Do this **one library at a time**. To read subtitles that are embedded in a
+video, ffmpeg has to read through the whole video file. dualsubs only reads
+each file once, however many tracks and pairs it needs from it, but the first
+pass over a large library is still a lot of disk reading. Run it in tmux so it
+keeps going after you disconnect, and log the output:
+
+```bash
+ssh plex-server 'tmux new -d -s dualsubs "~/.local/bin/dualsubs add library:<Name> >> ~/dualsubs.log 2>&1"'
+ssh plex-server 'tail -f ~/dualsubs.log'        # watch progress; Ctrl-C to stop watching
+```
+
+When it finishes, do the next library. Items that are already done are skipped
+cheaply, so it's safe to re-run.
+
+### 6. Handle new items automatically
+
+Add a cron job that checks recently added items every 15 minutes. Unlike tmux,
+cron survives server reboots. Open the crontab with `ssh -t plex-server 'crontab -e'`
+and add:
 
 ```
-*/15 * * * *  $HOME/.local/bin/dualsubs scan >> $HOME/dualsubs.log 2>&1
+*/15 * * * *  $HOME/.local/bin/dualsubs watch --once >> $HOME/dualsubs.log 2>&1
 ```
+
+`watch --once` only looks at recently added items, so each run is quick. Use it
+rather than `scan`, which checks every item every time. Only one dualsubs run
+works at a time. If cron fires while a long run from step 5 is still going, it
+logs "skipped" and tries again next time, so the two never overwrite each
+other's progress.
+
+(If cron isn't available, `dualsubs watch` keeps running and checks every 10
+minutes, for example in tmux. That stops if the server reboots.)
 
 ### Update
 
@@ -129,8 +161,16 @@ If your server has no tmux, use cron instead (`ssh -t plex-server 'crontab -e'`)
 ssh plex-server 'cd ~/dualsubs && git pull && ./install.sh'
 ```
 
-If dualsubs is in `watch` mode, restart it afterwards:
-`ssh plex-server 'tmux kill-session -t dualsubs'`, then start it again as in step 4.
+Cron picks up the new version on its next run. If you have a `watch` running in
+tmux, restart it.
+
+### Uninstall
+
+```bash
+ssh plex-server '~/.local/bin/dualsubs remove all'   # take the tracks out of Plex first
+ssh -t plex-server 'crontab -e'                       # delete the dualsubs line
+ssh plex-server 'tmux kill-session -t dualsubs 2>/dev/null; rm -rf ~/dualsubs ~/.local/share/dualsubs ~/.local/bin/dualsubs ~/.config/dualsubs ~/dualsubs.log'
+```
 
 ### Running it directly on the Plex machine
 
@@ -170,9 +210,11 @@ dualsubs add "The Bear" --dry-run    # what would happen, changing nothing
 dualsubs add "The Bear"              # whole show (or a movie, season, ratingKey)
 dualsubs add library:Movies          # a whole library
 dualsubs scan                        # everything
+dualsubs watch --once                # check recently added items once (for cron)
 dualsubs watch                       # keep running; handle new items every 10 min
 dualsubs remove "The Bear"           # take all bilingual tracks off again
 dualsubs remove "The Bear" --pair en+fr   # ...or just one pair
+dualsubs remove all                  # every track dualsubs ever added
 dualsubs merge nl.srt en.srt -o both.srt   # offline, no Plex needed
 ```
 

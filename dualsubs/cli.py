@@ -27,8 +27,12 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> Path:
     config_dir().mkdir(parents=True, exist_ok=True)
     p = config_dir() / "config.json"
-    p.write_text(json.dumps(cfg, indent=2))
-    p.chmod(0o600)  # holds the Plex token
+    # Holds the Plex token: create it private (0600) so it is never readable by
+    # other users, not even for a moment, and fix up an older file's mode.
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(cfg, indent=2))
     return p
 
 
@@ -41,7 +45,7 @@ def _opt(args, name, env, cfg, default=None):
     return cfg.get(name, default)
 
 
-def build(args):
+def build(args, lock: bool = False):
     cfg = load_config()
     url = _opt(args, "url", "PLEX_URL", cfg)
     token = _opt(args, "token", "PLEX_TOKEN", cfg)
@@ -64,6 +68,12 @@ def build(args):
         path_map=path_map,
     )
     state = State(_opt(args, "state", "DUALSUBS_STATE", cfg) or config_dir() / "state.json")
+    if lock and not getattr(args, "dry_run", False) and not state.lock():
+        msg = "another dualsubs run is already working on this library (e.g. `watch` in tmux, or cron); not starting a second one"
+        if getattr(args, "once", False):
+            print(time.strftime("%Y-%m-%d %H:%M ") + "skipped: " + msg, flush=True)
+            sys.exit(0)  # normal for cron while a long run is busy
+        sys.exit(msg)
     return Plex(url, token), settings, state
 
 
@@ -187,7 +197,7 @@ def cmd_inspect(args):
 
 
 def cmd_add(args):
-    plex, settings, state = build(args)
+    plex, settings, state = build(args, lock=True)
     keys = resolve_targets(plex, args.target)
     return run_items(plex, settings, state, keys, args)
 
@@ -198,14 +208,19 @@ def cmd_scan(args):
 
 
 def cmd_remove(args):
-    plex, settings, state = build(args)
+    plex, settings, state = build(args, lock=True)
     pairs = settings.pairs if (args.pair or args.primary or args.secondary) else None
-    for k in resolve_targets(plex, args.target):
-        print(remove_item(plex, k, state, pairs).line())
+    # "all": only items we've touched (from the state file), not the whole library.
+    keys = list(state.data) if args.target == "all" else resolve_targets(plex, args.target)
+    for k in keys:
+        try:
+            print(remove_item(plex, k, state, pairs).line(), flush=True)
+        except PlexError as e:
+            print(f"[!] {k}: {e}", flush=True)
 
 
 def cmd_watch(args):
-    plex, settings, state = build(args)
+    plex, settings, state = build(args, lock=True)
     labels = ", ".join(pair_label(p) for p in settings.pairs)
     print(f"Watching for new items every {args.interval}s ({labels}). Ctrl-C to stop.", flush=True)
     if args.initial_scan:
@@ -287,7 +302,8 @@ def main(argv=None):
     s.add_argument("--interval", type=int, default=600, help="seconds between checks (default 600)")
     s.add_argument("--batch", type=int, default=100, help="how many recently added items to check")
     s.add_argument("--initial-scan", action="store_true", help="process the whole library first")
-    s.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--once", action="store_true",
+                   help="check recently added items once and exit (use this from cron)")
     s.set_defaults(fn=cmd_watch)
 
     s = sub.add_parser("remove", parents=[work], help="remove the bilingual tracks dualsubs added")

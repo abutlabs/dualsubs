@@ -245,24 +245,51 @@ def find_ffmpeg() -> str:
 
 
 def extract_embedded(file: str, index: int, codec: str) -> tuple[bytes, str]:
-    out_fmt = "ass" if codec in ("ass", "ssa") else "srt"
+    return extract_embedded_many(file, [(index, codec)])[index]
+
+
+def extract_embedded_many(file: str, streams: list[tuple[int, str]]) -> dict[int, tuple[bytes, str]]:
+    """Extract several embedded subtitle streams in ONE pass over the video file.
+
+    ffmpeg has to read through the whole container to collect a subtitle
+    track, so pulling every track we need in a single run matters on big files.
+    Returns {container index: (bytes, format)}.
+    """
+    import tempfile
+
     if not os.path.exists(file):
         raise PlexError(f"can't open {file} (is the media folder mounted here? see --path-map)")
-    cmd = [find_ffmpeg(), "-nostdin", "-v", "error", "-i", file, "-map", f"0:{index}", "-f", out_fmt, "-"]
+    exe = find_ffmpeg()
     env = dict(os.environ)
-    if "Plex Transcoder" in cmd[0]:
+    if "Plex Transcoder" in exe:
         # Plex's transcoder finds its codec libraries relative to its own folder.
-        env["LD_LIBRARY_PATH"] = os.path.dirname(cmd[0]) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-    try:
-        res = subprocess.run(cmd, capture_output=True, timeout=600, env=env)
-    except OSError as e:
-        raise PlexError(f"could not run {cmd[0]}: {e}") from e
-    if res.returncode != 0 or not res.stdout:
-        msg = res.stderr.decode(errors="replace").strip()[-300:]
-        if "No such file" in msg:
-            msg += " (is the media folder mounted? see --path-map)"
-        raise PlexError(f"ffmpeg could not extract stream {index} from {file}: {msg}")
-    return res.stdout, out_fmt
+        env["LD_LIBRARY_PATH"] = os.path.dirname(exe) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    with tempfile.TemporaryDirectory(prefix="dualsubs-") as tmp:
+        cmd = [exe, "-nostdin", "-v", "error", "-y", "-i", file]
+        outs = {}
+        for index, codec in dict(streams).items():
+            fmt = "ass" if codec in ("ass", "ssa") else "srt"
+            path = os.path.join(tmp, f"{index}.{fmt}")
+            cmd += ["-map", f"0:{index}", "-f", fmt, path]
+            outs[index] = (path, fmt)
+        try:
+            res = subprocess.run(cmd, capture_output=True, timeout=3600, env=env)
+        except OSError as e:
+            raise PlexError(f"could not run {exe}: {e}") from e
+        except subprocess.TimeoutExpired as e:
+            raise PlexError(f"ffmpeg took over an hour reading {file}") from e
+        result = {}
+        for index, (path, fmt) in outs.items():
+            data = open(path, "rb").read() if os.path.exists(path) else b""
+            if data:
+                result[index] = (data, fmt)
+        if not result:
+            msg = res.stderr.decode(errors="replace").strip()[-300:]
+            raise PlexError(f"ffmpeg could not extract subtitle streams {sorted(outs)} from {file}: {msg}")
+        missing = set(outs) - set(result)
+        for index in missing:
+            result[index] = (b"", outs[index][1])  # empty track; caller falls back to another candidate
+        return result
 
 
 # ---------------------------------------------------------------------- plex.tv sign-in

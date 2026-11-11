@@ -13,7 +13,7 @@ from pathlib import Path
 from .align import MergeStats, Style, merge
 from .languages import name as lang_name
 from .languages import normalize
-from .plex import Item, Plex, PlexError, SubStream, map_path
+from .plex import Item, Plex, PlexError, SubStream, extract_embedded_many, map_path
 from .subtitles import parse, write_srt
 
 MARKER = "dualsubs"
@@ -94,6 +94,29 @@ class State:
         if self.path and self.path.exists():
             self.data = json.loads(self.path.read_text() or "{}")
 
+    def lock(self) -> bool:
+        """Take an exclusive lock for this state file; False if another run holds it.
+
+        Two runs writing the same state (a `watch` in tmux plus a cron job, say)
+        would lose each other's updates. The lock lives as long as this process.
+        """
+        if not self.path:
+            return True
+        try:
+            import fcntl
+        except ImportError:  # Windows: no locking
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_file = open(self.path.with_name(self.path.name + ".lock"), "w")
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lock_file.close()
+            return False
+        self._lock_file.write(str(os.getpid()))
+        self._lock_file.flush()
+        return True
+
     def get(self, key: str, pair: Pair | None = None) -> dict:
         entry = self.data.get(key, {})
         return entry.get("+".join(pair), {}) if pair else entry
@@ -159,6 +182,7 @@ def process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dr
         return [Result(rating_key, item.title, "error", "item has no media file")]
 
     cache: dict[int, list] = {}  # stream id -> parsed cues, shared between pairs
+    _prefetch_embedded(plex, item, cfg, state, cache, force)
     results = []
     for pair in cfg.pairs:
         out = save_to if (save_to and len(cfg.pairs) == 1) else (
@@ -173,26 +197,67 @@ def process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dr
     return results
 
 
+def _context(item: Item, pair: Pair, cfg: Settings, state: State) -> dict:
+    """What we know about one pair on one item, and whether it needs (re)doing."""
+    prev = state.get(item.rating_key, pair)
+    filename = cfg.track_filename(pair)
+    all_ours = [s for s in item.subtitles if is_ours(s, state.all_stream_ids(item.rating_key))]
+    mine = [s for s in all_ours if belongs_to(s, pair, prev, filename)]
+    sources = [s for s in item.subtitles if s not in all_ours]
+    signature = hashlib.sha1(json.dumps(
+        [cfg.fingerprint(pair), sorted((s.id, s.language, s.codec, s.forced) for s in sources)]
+    ).encode()).hexdigest()[:16]
+    done = mine if cfg.mode == "upload" else (prev.get("sidecar") and Path(prev["sidecar"]).exists())
+    return {"prev": prev, "filename": filename, "mine": mine, "sources": sources, "signature": signature,
+            "up_to_date": bool(prev.get("signature") == signature and done)}
+
+
+def _can_read(item: Item, cfg: Settings) -> bool:
+    part = item.parts[0]
+    return bool(part.file) and os.path.exists(map_path(part.file, cfg.path_map))
+
+
+def _prefetch_embedded(plex: Plex, item: Item, cfg: Settings, state: State, cache: dict, force: bool) -> None:
+    """Pull every embedded track the pending pairs will want in one ffmpeg pass.
+
+    ffmpeg reads the whole video file per run, so on large libraries one run per
+    file (instead of one per subtitle) is the difference that matters.
+    """
+    if not _can_read(item, cfg):
+        return
+    wanted: dict[int, SubStream] = {}
+    for pair in cfg.pairs:
+        ctx = _context(item, pair, cfg, state)
+        if ctx["up_to_date"] and not force:
+            continue
+        for lang in pair:
+            cands = candidates(ctx["sources"], lang, True)
+            if cands and not cands[0].external and cands[0].index is not None and cands[0].id not in cache:
+                wanted[cands[0].id] = cands[0]
+    if not wanted:
+        return
+    part = item.parts[0]
+    try:
+        got = extract_embedded_many(map_path(part.file, cfg.path_map), [(s.index, s.codec) for s in wanted.values()])
+    except PlexError:
+        return  # each pair retries on its own and reports the error
+    for s in wanted.values():
+        data, fmt = got.get(s.index, (b"", "srt"))
+        cache[s.id] = parse(data, fmt) if data else []
+
+
 def _process_pair(plex: Plex, item: Item, pair: Pair, cfg: Settings, state: State, cache: dict, *,
                   dry_run, force, save_to) -> Result:
     def result(status, detail="", stats=None):
         return Result(item.rating_key, item.title, status, detail, stats, pair)
 
     part = item.parts[0]
-    prev = state.get(item.rating_key, pair)
-    filename = cfg.track_filename(pair)
-    all_ours = [s for s in item.subtitles if is_ours(s, state.all_stream_ids(item.rating_key))]
-    mine = [s for s in all_ours if belongs_to(s, pair, prev, filename)]
-    sources = [s for s in item.subtitles if s not in all_ours]
-
-    signature = hashlib.sha1(json.dumps(
-        [cfg.fingerprint(pair), sorted((s.id, s.language, s.codec, s.forced) for s in sources)]
-    ).encode()).hexdigest()[:16]
-    done = mine if cfg.mode == "upload" else (prev.get("sidecar") and Path(prev["sidecar"]).exists())
-    if not force and prev.get("signature") == signature and done:
+    ctx = _context(item, pair, cfg, state)
+    prev, filename, mine, sources, signature = (ctx[k] for k in ("prev", "filename", "mine", "sources", "signature"))
+    if not force and ctx["up_to_date"]:
         return result("up-to-date")
 
-    can_read = bool(part.file) and os.path.exists(map_path(part.file, cfg.path_map))
+    can_read = _can_read(item, cfg)
     picked = {}
     for lang in pair:
         cands = candidates(sources, lang, can_read)
