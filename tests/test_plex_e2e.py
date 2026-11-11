@@ -41,6 +41,11 @@ In the kitchen,
 next to the teapot.
 """
 
+ES = (EN.replace("Good morning, everyone.", "Buenos días a todos.").replace("Where's the coffee?", "¿Dónde está el café?")
+      .replace("In the kitchen,", "En la cocina,").replace("next to the teapot.", "junto a la tetera."))
+FR = (NL.replace("Goedemorgen, iedereen.", "Bonjour à tous.").replace("Waar is de koffie?", "Où est le café ?")
+      .replace("In de keuken,\nnaast de theepot.", "Dans la cuisine,\nà côté de la théière."))
+
 EN_SDH = EN.replace("Where's the coffee?", "[KETTLE WHISTLES] Where's the coffee?")
 
 needs_ffmpeg = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
@@ -69,6 +74,8 @@ def plex(media, tmp_path, monkeypatch):
         {"id": 303, "codec": "pgs", "index": 3, "languageCode": "ger", "displayTitle": "Deutsch (PGS)"},
     ])
     fake.add_external("101", 304, "eng", EN.encode(), displayTitle="English (SRT External)")
+    fake.add_external("101", 305, "spa", ES.encode(), displayTitle="Español (SRT External)")
+    fake.add_external("101", 306, "fre", FR.encode(), displayTitle="Français (SRT External)")
     srv, url = serve(fake)
     monkeypatch.setenv("PLEX_URL", url)
     monkeypatch.setenv("PLEX_TOKEN", TOKEN)
@@ -82,7 +89,7 @@ def plex(media, tmp_path, monkeypatch):
 def test_add_by_title_uploads_merged_track(plex, capsys):
     assert main(["add", "Koffie", "-p", "nl", "-s", "en"]) == 0
     out = capsys.readouterr().out
-    assert "[+] Koffie (2024): added" in out
+    assert "[+] Koffie (2024) [NL+EN]: added" in out
     # Embedded Dutch + external non-SDH English were chosen over embedded SDH English.
     assert "nl srt embedded #1 + en srt external" in out
     assert "shifted -1.20s" in out
@@ -145,7 +152,7 @@ def test_watch_once_and_inspect(plex, capsys):
 @needs_ffmpeg
 def test_sidecar_mode(plex, media, capsys):
     assert main(["add", "101", "--mode", "sidecar"]) == 0
-    side = media.parent / "film.dualsubs.nl.srt"
+    side = media.parent / "film.dualsubs-en.nl.srt"
     assert side.exists() and "Good morning" in side.read_text()
     assert plex.uploads == []
     main(["add", "101", "--mode", "sidecar"])
@@ -159,3 +166,44 @@ def test_bad_token(plex, monkeypatch):
     with pytest.raises(SystemExit) as e:
         main(["libraries"])
     assert "401" in str(e.value)
+
+
+@needs_ffmpeg
+def test_multiple_pairs(plex, capsys, tmp_path, monkeypatch):
+    # Pairs from the config file, as a user would set them up once.
+    (tmp_path / "home").mkdir(exist_ok=True)
+    (tmp_path / "home" / "config.json").write_text('{"pairs": ["en+es", "en+fr", "en+nl"]}')
+    assert main(["add", "101"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("]: added") == 3 and "Summary: 3 added" in out
+    titles = [u["title"] for u in plex.uploads]
+    assert titles == ["dualsubs EN+ES.en.srt", "dualsubs EN+FR.en.srt", "dualsubs EN+NL.en.srt"]
+    es = parse(plex.uploads[0]["body"])
+    assert es[1].text == "Where's the coffee?\n\u00bfD\u00f3nde est\u00e1 el caf\u00e9?"
+    fr = parse(plex.uploads[1]["body"])
+    assert fr[0].text == "Good morning, everyone.\nBonjour \u00e0 tous."
+    # Re-run: all three up to date, nothing re-uploaded; our tracks never used as sources.
+    main(["add", "101"])
+    assert len(plex.uploads) == 3
+    # Redo just one pair with a new style: only that track is replaced.
+    main(["add", "101", "--pair", "en+fr", "--force", "--italic"])
+    assert len(plex.uploads) == 4
+    ours = sorted(s["title"] for s in plex.items["101"]["streams"] if "dualsubs" in s.get("title", ""))
+    assert ours == ["dualsubs EN+ES.en.srt", "dualsubs EN+FR.en.srt", "dualsubs EN+NL.en.srt"]
+    # Remove one pair, then everything.
+    main(["remove", "101", "--pair", "en+es"])
+    ours = sorted(s["title"] for s in plex.items["101"]["streams"] if "dualsubs" in s.get("title", ""))
+    assert ours == ["dualsubs EN+FR.en.srt", "dualsubs EN+NL.en.srt"]
+    main(["remove", "101"])
+    assert not [s for s in plex.items["101"]["streams"] if "dualsubs" in s.get("title", "")]
+
+
+def test_pair_parsing():
+    from dualsubs.pipeline import parse_pair
+    assert parse_pair("en+es") == ("en", "es")
+    assert parse_pair("English/Spanish") == ("en", "es")
+    assert parse_pair("eng-fre") == ("en", "fr")
+    assert parse_pair("nl:en") == ("nl", "en")
+    for bad in ("en", "en+en", "en+xx", "en+es+fr"):
+        with pytest.raises(ValueError):
+            parse_pair(bad)

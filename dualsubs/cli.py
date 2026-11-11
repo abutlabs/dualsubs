@@ -10,21 +10,22 @@ from pathlib import Path
 
 from . import __version__, plex as plexmod
 from .align import Style, merge
-from .pipeline import Settings, State, looks_like_key, process_item, remove_item
+from .pipeline import Settings, State, looks_like_key, pair_label, process_item, remove_item
 from .plex import Plex, PlexError
 from .subtitles import parse, write_srt
 
-CONFIG_DIR = Path(os.environ.get("DUALSUBS_HOME") or Path.home() / ".config" / "dualsubs")
+def config_dir() -> Path:
+    return Path(os.environ.get("DUALSUBS_HOME") or Path.home() / ".config" / "dualsubs")
 
 
 def load_config() -> dict:
-    p = CONFIG_DIR / "config.json"
+    p = config_dir() / "config.json"
     return json.loads(p.read_text()) if p.exists() else {}
 
 
 def save_config(cfg: dict) -> Path:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    p = CONFIG_DIR / "config.json"
+    config_dir().mkdir(parents=True, exist_ok=True)
+    p = config_dir() / "config.json"
     p.write_text(json.dumps(cfg, indent=2))
     p.chmod(0o600)  # holds the Plex token
     return p
@@ -56,14 +57,27 @@ def build(args):
     if ff:
         plexmod.FFMPEG = ff
     settings = Settings(
-        primary=_opt(args, "primary", "DUALSUBS_PRIMARY", cfg, "nl"),
-        secondary=_opt(args, "secondary", "DUALSUBS_SECONDARY", cfg, "en"),
+        pairs=pairs_from(args, cfg),
         style=style_from(args, cfg),
         mode=_opt(args, "mode", "DUALSUBS_MODE", cfg, "upload"),
         path_map=path_map,
     )
-    state = State(_opt(args, "state", "DUALSUBS_STATE", cfg) or CONFIG_DIR / "state.json")
+    state = State(_opt(args, "state", "DUALSUBS_STATE", cfg) or config_dir() / "state.json")
     return Plex(url, token), settings, state
+
+
+def pairs_from(args, cfg) -> list:
+    """--pair (repeatable) > -p/-s > DUALSUBS_PAIRS > config 'pairs' > config primary/secondary > nl+en."""
+    if getattr(args, "pair", None):
+        return [p for arg in args.pair for p in arg.split(",")]
+    p, s = getattr(args, "primary", None), getattr(args, "secondary", None)
+    if p or s:
+        return [f"{p or cfg.get('primary', 'nl')}+{s or cfg.get('secondary', 'en')}"]
+    if os.environ.get("DUALSUBS_PAIRS"):
+        return os.environ["DUALSUBS_PAIRS"].split(",")
+    if cfg.get("pairs"):
+        return cfg["pairs"]
+    return [f"{cfg.get('primary', 'nl')}+{cfg.get('secondary', 'en')}"]
 
 
 def style_from(args, cfg) -> Style:
@@ -105,10 +119,11 @@ def resolve_targets(plex: Plex, target: str) -> list[str]:
 def run_items(plex, settings, state, keys, args) -> int:
     counts: dict[str, int] = {}
     for k in keys:
-        res = process_item(plex, k, settings, state, dry_run=args.dry_run, force=args.force, save_to=getattr(args, "save", None))
-        counts[res.status] = counts.get(res.status, 0) + 1
-        if res.status != "up-to-date" or args.verbose:
-            print(res.line(), flush=True)
+        for res in process_item(plex, k, settings, state, dry_run=args.dry_run, force=args.force,
+                                save_to=getattr(args, "save", None)):
+            counts[res.status] = counts.get(res.status, 0) + 1
+            if res.status != "up-to-date" or args.verbose:
+                print(res.line(), flush=True)
     print("Summary: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) if counts else "Nothing to do.")
     return 1 if counts.get("error") else 0
 
@@ -174,23 +189,25 @@ def cmd_scan(args):
 
 
 def cmd_remove(args):
-    plex, _, state = build(args)
+    plex, settings, state = build(args)
+    pairs = settings.pairs if (args.pair or args.primary or args.secondary) else None
     for k in resolve_targets(plex, args.target):
-        print(remove_item(plex, k, state).line())
+        print(remove_item(plex, k, state, pairs).line())
 
 
 def cmd_watch(args):
     plex, settings, state = build(args)
-    print(f"Watching for new items every {args.interval}s ({settings.primary}+{settings.secondary}). Ctrl-C to stop.", flush=True)
+    labels = ", ".join(pair_label(p) for p in settings.pairs)
+    print(f"Watching for new items every {args.interval}s ({labels}). Ctrl-C to stop.", flush=True)
     if args.initial_scan:
         run_items(plex, settings, state, resolve_targets(plex, "all"), args)
     while True:
         try:
             keys = plex.recently_added(args.batch)
             for k in keys:
-                res = process_item(plex, k, settings, state)
-                if res.status != "up-to-date":
-                    print(time.strftime("%Y-%m-%d %H:%M ") + res.line(), flush=True)
+                for res in process_item(plex, k, settings, state):
+                    if res.status != "up-to-date":
+                        print(time.strftime("%Y-%m-%d %H:%M ") + res.line(), flush=True)
         except (PlexError, OSError) as e:
             print(f"{time.strftime('%Y-%m-%d %H:%M')} [!] {e}", flush=True)
         if args.once:
@@ -225,8 +242,11 @@ def main(argv=None):
     style.add_argument("--compact", action="store_true", help="one line per language")
 
     work = argparse.ArgumentParser(add_help=False, parents=[conn, style])
-    work.add_argument("-p", "--primary", help="main language, shown first (default nl)")
-    work.add_argument("-s", "--secondary", help="second language (default en)")
+    work.add_argument("--pair", action="append", metavar="EN+ES",
+                      help="language pair, main language first; repeat (or comma-separate) for several, "
+                           "each becomes its own track (default nl+en, or 'pairs' in the config)")
+    work.add_argument("-p", "--primary", help="shorthand for a single pair: main language")
+    work.add_argument("-s", "--secondary", help="shorthand for a single pair: second language")
     work.add_argument("--mode", choices=["upload", "sidecar"], help="upload into Plex (default) or write a .srt next to the video")
     work.add_argument("--path-map", action="append", metavar="PLEX_PATH=LOCAL_PATH", help="translate media paths if this machine mounts them elsewhere")
     work.add_argument("--ffmpeg", help="path to ffmpeg (or Plex's 'Plex Transcoder')")

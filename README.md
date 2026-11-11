@@ -57,12 +57,23 @@ dualsubs libraries        # check it can see your libraries
 (readable only by you). You can also use `--url/--token` or
 `PLEX_URL`/`PLEX_TOKEN` instead.
 
-The language pair defaults to Dutch on top and English underneath. Change it per
-command with `-p`/`-s`, or for good in the config file:
+### Language pairs
+
+A pair is written main language first, e.g. `en+es` means English on top and
+Spanish underneath. The default is `nl+en`. You can have as many pairs as you
+like; each one becomes its own subtitle track on every item, so you pick
+"EN+ES" or "EN+FR" on the TV depending on who's watching.
+
+Set them once in `~/.config/dualsubs/config.json`:
 
 ```json
-{ "primary": "nl", "secondary": "en", "style": { "secondary_color": "#FFD54F" } }
+{ "pairs": ["en+es", "en+fr", "nl+en"], "style": { "secondary_color": "#FFD54F" } }
 ```
+
+or per command with `--pair en+es --pair en+fr` (also `--pair en+es,en+fr`), or
+the `DUALSUBS_PAIRS=en+es,en+fr` environment variable. Language names work too:
+`--pair English+Spanish`. An item only gets a pair's track if it has subtitles
+in both languages; otherwise dualsubs reports which one is missing.
 
 ## Use
 
@@ -73,12 +84,13 @@ dualsubs add "The Bear"              # whole show (or a movie, season, ratingKey
 dualsubs add library:Movies          # a whole library
 dualsubs scan                        # everything
 dualsubs watch                       # keep running; handle new items every 10 min
-dualsubs remove "The Bear"           # take the bilingual tracks off again
+dualsubs remove "The Bear"           # take all bilingual tracks off again
+dualsubs remove "The Bear" --pair en+fr   # ...or just one pair
 dualsubs merge nl.srt en.srt -o both.srt   # offline, no Plex needed
 ```
 
-On the TV, start playback, open subtitles and pick the track called
-**"dualsubs NL+EN"**. The exact label depends on your Plex version; `add`
+On the TV, start playback, open subtitles and pick the track for your pair,
+e.g. **"dualsubs EN+ES"**. The exact label depends on your Plex version; `add`
 prints what Plex calls it.
 
 ### Keep it running on a seedbox
@@ -105,7 +117,10 @@ For example, when Plex runs in Docker: `--path-map /data/media=/home/me/media`
 This is a prototype, built and tested against a simulated Plex server and real
 ffmpeg-made `.mkv` files. Still to confirm on a real server:
 
-- how Plex labels the uploaded track in its subtitle menu;
+- how Plex labels the uploaded track in its subtitle menu. With several pairs
+  that share a main language (EN+ES, EN+FR), the label must show the track's
+  title, not just "English", to tell them apart. If it doesn't, change the
+  `filename` template in the config;
 - that the Plex app on Android TV renders the coloured second line. If it
   doesn't, use `--color none --italic`;
 - `--mode sidecar` (writes a `.srt` next to the video instead of uploading).
