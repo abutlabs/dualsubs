@@ -33,38 +33,119 @@ before. Plex remembers your subtitle choice per show.
 5. It remembers what it did, so re-runs skip finished items, and it refreshes an
    item when its source subtitles change.
 
-## Install (on the machine where Plex's media lives, e.g. a seedbox)
+## Install
 
-dualsubs needs Python 3.9+ and `ffmpeg`. ffmpeg is used to read subtitles that
-are embedded in video files. If the machine has no ffmpeg, dualsubs falls back
-to Plex's own "Plex Transcoder", or you can point `--ffmpeg` at any ffmpeg
-binary. No root or Docker needed.
+dualsubs runs **on your Plex server**: a seedbox, NAS or home server. It has to
+run there because subtitles are often embedded inside the video files, and
+those only exist on that machine. You don't need root or Docker. The server
+needs Python 3.9+, git, and ffmpeg (or Plex's own transcoder, which dualsubs
+uses automatically when ffmpeg is missing).
+
+You install and run it from your own computer over SSH, so you never have to
+work on the server directly.
+
+### 1. Set up an SSH shortcut to your Plex server (once)
+
+If `ssh plex-server` already logs you in without a password, skip ahead.
+Replace everything in `<angle brackets>` with your own values.
 
 ```bash
-git clone https://github.com/abutlabs/dualsubs.git
-cd dualsubs
-python3 -m pip install --user .        # puts `dualsubs` in ~/.local/bin
+# On your computer: make a key (skip if you have ~/.ssh/id_ed25519)
+ssh-keygen -t ed25519 -C "<a-label-for-this-key>"
+
+# Put the public key on the server (asks for the server password once)
+ssh-copy-id -i ~/.ssh/id_ed25519.pub <username>@<server-hostname>
 ```
 
-## Set up
+Add a shortcut to `~/.ssh/config` on your computer, then `chmod 600 ~/.ssh/config`:
+
+```
+Host plex-server
+    HostName <server-hostname>
+    User <username>
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    AddKeysToAgent yes
+    UseKeychain yes        # macOS only: remembers the key's passphrase
+```
+
+Check it with `ssh plex-server`. Some seedbox providers make you turn on SSH or
+key login in their control panel first. If the login fails, `ssh -v plex-server`
+shows why. Only the `.pub` file ever goes on the server; never copy the private
+key anywhere.
+
+The rest of this guide uses `plex-server`. If your shortcut has another name,
+use that instead.
+
+### 2. Install dualsubs on the server
 
 ```bash
-dualsubs login            # prints a link: sign in to Plex, approve, done
-dualsubs libraries        # check it can see your libraries
+ssh plex-server 'git clone https://github.com/abutlabs/dualsubs.git ~/dualsubs && ~/dualsubs/install.sh'
 ```
 
-`login` saves your server address and token in `~/.config/dualsubs/config.json`
-(readable only by you). You can also use `--url/--token` or
-`PLEX_URL`/`PLEX_TOKEN` instead.
+The installer puts dualsubs in your home folder (`~/.local/share/dualsubs`, with
+the command at `~/.local/bin/dualsubs`). It also checks for ffmpeg and tells you
+if anything is missing.
 
-### Language pairs
+### 3. Connect it to Plex
+
+```bash
+ssh -t plex-server '~/.local/bin/dualsubs login'
+```
+
+This prints a link. Open it in the browser on your computer, sign in to Plex
+and approve dualsubs. It then finds your server and saves the connection on the
+server in `~/.config/dualsubs/config.json`, readable only by you. Check it worked:
+
+```bash
+ssh plex-server '~/.local/bin/dualsubs libraries'
+```
+
+### 4. Try it on one show, then turn on automatic mode
+
+```bash
+ssh plex-server '~/.local/bin/dualsubs add "<a show or movie>" --dry-run'   # preview
+ssh plex-server '~/.local/bin/dualsubs add "<a show or movie>"'             # do it
+```
+
+Play it on your TV and pick the dualsubs track. If you're happy, have the server
+handle everything, including new episodes as they arrive:
+
+```bash
+ssh plex-server 'tmux new -d -s dualsubs "~/.local/bin/dualsubs watch --initial-scan"'
+```
+
+That keeps running after you disconnect. To look in on it, run
+`ssh -t plex-server 'tmux attach -t dualsubs'` and press Ctrl-B then D to leave.
+If your server has no tmux, use cron instead (`ssh -t plex-server 'crontab -e'`):
+
+```
+*/15 * * * *  $HOME/.local/bin/dualsubs scan >> $HOME/dualsubs.log 2>&1
+```
+
+### Update
+
+```bash
+ssh plex-server 'cd ~/dualsubs && git pull && ./install.sh'
+```
+
+If dualsubs is in `watch` mode, restart it afterwards:
+`ssh plex-server 'tmux kill-session -t dualsubs'`, then start it again as in step 4.
+
+### Running it directly on the Plex machine
+
+Clone the repo, run `./install.sh` and use `dualsubs ...` without the `ssh`
+prefix. `dualsubs login` works the same way.
+
+## Language pairs
 
 A pair is written main language first, e.g. `en+es` means English on top and
 Spanish underneath. The default is `nl+en`. You can have as many pairs as you
 like; each one becomes its own subtitle track on every item, so you pick
 "EN+ES" or "EN+FR" on the TV depending on who's watching.
 
-Set them once in `~/.config/dualsubs/config.json`:
+Set them once in `~/.config/dualsubs/config.json` **on the server**
+(`ssh plex-server 'nano ~/.config/dualsubs/config.json'`):
 
 ```json
 { "pairs": ["en+es", "en+fr", "nl+en"], "style": { "secondary_color": "#FFD54F" } }
@@ -75,7 +156,13 @@ the `DUALSUBS_PAIRS=en+es,en+fr` environment variable. Language names work too:
 `--pair English+Spanish`. An item only gets a pair's track if it has subtitles
 in both languages; otherwise dualsubs reports which one is missing.
 
-## Use
+## Commands
+
+Run these on the server, i.e. as `ssh plex-server '~/.local/bin/dualsubs ...'`.
+If you'll use it a lot, an alias on your computer saves typing:
+`alias dualsubs="ssh plex-server '~/.local/bin/dualsubs'"`. After that you can
+run it from your own terminal, e.g. `dualsubs add '"The Bear"'`. Titles with
+spaces need both quote types like that, because they pass through two shells.
 
 ```bash
 dualsubs inspect "The Bear"          # what subtitle tracks does Plex have?
@@ -93,21 +180,13 @@ On the TV, start playback, open subtitles and pick the track for your pair,
 e.g. **"dualsubs EN+ES"**. The exact label depends on your Plex version; `add`
 prints what Plex calls it.
 
-### Keep it running on a seedbox
-
-```bash
-tmux new -s dualsubs 'dualsubs watch --initial-scan'
-# or from cron, every 15 minutes:
-# */15 * * * *  $HOME/.local/bin/dualsubs scan >> $HOME/dualsubs.log 2>&1
-```
-
-### Style options
+## Style options
 
 `--color '#80DEEA'` (or `none`), `--italic`, `--secondary-on-top`, and
 `--compact` (one line per language, good for long sentences). Use `--force` to
 redo items with the new style.
 
-### If Plex and dualsubs see the media at different paths
+## If Plex and dualsubs see the media at different paths
 
 For example, when Plex runs in Docker: `--path-map /data/media=/home/me/media`
 (or `DUALSUBS_PATH_MAP`).

@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import __version__, plex as plexmod
 from .align import Style, merge
@@ -140,12 +141,20 @@ def cmd_login(args):
             f"No server named {args.server!r} on this account")
     chosen = None
     for srv in servers:
-        for url in srv["urls"]:
+        # When dualsubs runs on the Plex machine itself (the usual setup), localhost
+        # on Plex's port is the most direct route; then whatever plex.tv reports.
+        ports = list(dict.fromkeys([urlparse(u).port or 32400 for u in srv["urls"]] + [32400]))
+        local = [f"http://127.0.0.1:{p}" for p in ports]
+        for url in local + srv["urls"]:
             try:
-                chosen = (srv, url, Plex(url, srv["token"], timeout=5).identity())
-                break
+                info = Plex(url, srv["token"], timeout=5).identity()
             except Exception:  # noqa: BLE001 - try the next connection
                 continue
+            # On shared hosts, localhost:32400 can be someone else's Plex.
+            if srv.get("id") and info.get("id") and info["id"] != srv["id"]:
+                continue
+            chosen = (srv, url, info)
+            break
         if chosen:
             break
     if not chosen:

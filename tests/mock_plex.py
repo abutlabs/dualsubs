@@ -46,7 +46,7 @@ class FakePlex:
     def handle(self, method, path, query, body):
         self.requests.append(f"{method} {path}")
         if path == "/":
-            return 200, '<MediaContainer friendlyName="FakePlex" version="1.41.0"/>'
+            return 200, '<MediaContainer friendlyName="FakePlex" version="1.41.0" machineIdentifier="fake-machine"/>'
         if path == "/library/sections":
             return 200, '<MediaContainer><Directory key="1" type="movie" title="Movies"/></MediaContainer>'
         if path == "/library/sections/1/all" or path == "/library/recentlyAdded":

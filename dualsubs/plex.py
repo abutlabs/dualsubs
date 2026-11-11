@@ -109,7 +109,7 @@ class Plex:
     # ------------------------------------------------------------------ browse
     def identity(self) -> dict:
         root = self._xml("/")
-        return {"name": root.get("friendlyName"), "version": root.get("version")}
+        return {"name": root.get("friendlyName"), "version": root.get("version"), "id": root.get("machineIdentifier")}
 
     def libraries(self) -> list[dict]:
         return [
@@ -274,9 +274,10 @@ def _client_id() -> str:
     return "dualsubs-" + uuid.uuid5(uuid.NAMESPACE_DNS, uuid.getnode().__str__()).hex[:12]
 
 
-def login_pin(session: requests.Session | None = None, poll: float = 2.0, timeout: float = 300, out=print) -> str:
+def login_pin(session: requests.Session | None = None, poll: float = 2.0, timeout: float = 300, out=None) -> str:
     """Sign in through app.plex.tv in a browser and return an auth token."""
     s = session or requests.Session()
+    out = out or (lambda msg: print(msg, flush=True))  # flush: often run over ssh
     cid = _client_id()
     headers = {"Accept": "application/json", "X-Plex-Product": "dualsubs", "X-Plex-Client-Identifier": cid}
     pin = s.post(f"{PLEX_TV}/api/v2/pins", params={"strong": "true"}, headers=headers, timeout=30).json()
@@ -311,6 +312,7 @@ def discover_servers(token: str, session: requests.Session | None = None) -> lis
         conns = sorted(res.get("connections", []), key=lambda c: (not c.get("local"), c.get("relay", False)))
         servers.append({
             "name": res.get("name"),
+            "id": res.get("clientIdentifier"),
             "token": res.get("accessToken") or token,
             "urls": [c["uri"] for c in conns],
         })
