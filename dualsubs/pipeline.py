@@ -167,6 +167,13 @@ class State:
         self.data.setdefault(key, {}).setdefault("_fetch", {})[lang] = note
         self._dirty = True
 
+    def set_info(self, item) -> None:
+        """Remember where an item lives, for the overview in `dualsubs web`."""
+        self.data.setdefault(item.rating_key, {})["_info"] = {
+            "lib": item.library_id, "library": item.library, "title": item.title,
+            "show": item.show, "type": item.type}
+        self._dirty = True
+
     def fetches_today(self) -> int:
         b = self.data.get("_budget", {})
         return b.get("count", 0) if b.get("date") == time.strftime("%Y-%m-%d") else 0
@@ -229,6 +236,8 @@ def process_item(plex: Plex, rating_key: str, cfg: Settings, state: State, *, dr
     if not item.parts:
         return [Result(rating_key, item.title, "error", "item has no media file")]
 
+    if rating_key in state.data and "_info" not in state.data[rating_key]:
+        state.set_info(item)  # entries from older versions: fill in the library for the overview
     pending = [pair for pair in cfg.pairs if force or not _context(item, pair, cfg, state)["up_to_date"]]
     if cfg.fetch_missing and pending and not dry_run:
         item = _fetch_missing(plex, item, pending, cfg, state)
@@ -367,6 +376,7 @@ def _process_pair(plex: Plex, item: Item, pair: Pair, cfg: Settings, state: Stat
     def result(status, detail="", stats=None, **remember):
         if status in SETTLED and not dry_run:
             state.set(item.rating_key, pair, {"signature": signature, "status": status, **remember})
+            state.set_info(item)
         return Result(item.rating_key, item.title, status, detail, stats, pair)
 
     if not force and ctx["up_to_date"]:
@@ -424,7 +434,8 @@ def _process_pair(plex: Plex, item: Item, pair: Pair, cfg: Settings, state: Stat
     if cfg.mode == "sidecar":
         target = _sidecar_path(map_path(part.file, cfg.path_map), pair)
         target.write_bytes(srt)
-        state.set(item.rating_key, pair, {"signature": signature, "sidecar": str(target)})
+        state.set(item.rating_key, pair, {"signature": signature, "sidecar": str(target), "at": time.time()})
+        state.set_info(item)
         return result("added", detail + f"; wrote {target.name} (Plex shows it after its next scan)", stats)
 
     for s in mine:
@@ -432,7 +443,8 @@ def _process_pair(plex: Plex, item: Item, pair: Pair, cfg: Settings, state: Stat
     before = {s.id for s in plex.item(item.rating_key).subtitles}
     plex.upload_subtitle(item.rating_key, srt, filename)
     new = [s for s in plex.item(item.rating_key).subtitles if s.id not in before]
-    state.set(item.rating_key, pair, {"signature": signature, "stream_ids": [s.id for s in new]})
+    state.set(item.rating_key, pair, {"signature": signature, "stream_ids": [s.id for s in new], "at": time.time()})
+    state.set_info(item)
     shown = ", ".join(f"'{s.display or s.title}'" for s in new) or "(not listed yet; Plex may still be processing)"
     return result("added", detail + f"; Plex lists it as {shown}", stats)
 

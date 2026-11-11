@@ -42,7 +42,8 @@ class FakePlex:
             for s in it["streams"]
         )
         return (
-            f'<Video ratingKey="{rk}" type="{it["type"]}" title={quoteattr(it["title"])} year="{it["year"]}">'
+            f'<Video ratingKey="{rk}" type="{it["type"]}" title={quoteattr(it["title"])} year="{it["year"]}" '
+            f'librarySectionID="1" librarySectionTitle="Movies">'
             f'<Media id="{it["part_id"]}"><Part id="{it["part_id"]}" file={quoteattr(it["file"])}>'
             f'<Stream id="1" streamType="1" codec="h264" index="0"/>{streams}</Part></Media></Video>'
         )
@@ -58,6 +59,8 @@ class FakePlex:
             return 403, "Forbidden"
         if path == "/library/sections":
             return 200, '<MediaContainer><Directory key="1" type="movie" title="Movies"/></MediaContainer>'
+        if path == "/library/sections/1/all" and query.get("X-Plex-Container-Size") == ["0"]:
+            return 200, f'<MediaContainer size="0" totalSize="{len(self.items)}"/>'
         if path == "/library/sections/1/all" or path == "/library/recentlyAdded":
             vids = "".join(f'<Video ratingKey="{rk}" type="movie" title={quoteattr(i["title"])}/>' for rk, i in self.items.items())
             return 200, f"<MediaContainer>{vids}</MediaContainer>"

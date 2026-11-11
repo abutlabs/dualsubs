@@ -13,6 +13,7 @@ from . import __version__, plex as plexmod
 from .align import Style, merge
 from .pipeline import Settings, State, looks_like_key, pair_label, process_item, remove_item
 from .plex import Plex, PlexError
+from .progress import Progress
 from .subtitles import parse, write_srt
 
 def config_dir() -> Path:
@@ -151,8 +152,8 @@ class StreamGate:
     POLL = 60  # seconds between checks while paused
     CACHE_S = 30  # re-ask Plex at most this often
 
-    def __init__(self, plex: Plex, enabled: bool):
-        self.plex, self.enabled = plex, enabled
+    def __init__(self, plex: Plex, enabled: bool, progress: Progress | None = None):
+        self.plex, self.enabled, self.progress = plex, enabled, progress
         self._checked, self._count = 0.0, 0
 
     @staticmethod
@@ -178,7 +179,11 @@ class StreamGate:
         print(time.strftime("%Y-%m-%d %H:%M ") + f"paused: {self._count} Plex stream(s) playing; "
               "continuing when they stop", flush=True)
         while self.playing():
+            if self.progress:
+                self.progress.paused(self._count)
             self.sleep(self.POLL)
+        if self.progress:
+            self.progress.paused(0)
         print(time.strftime("%Y-%m-%d %H:%M ") + f"resumed after {int(time.time() - since) // 60} min", flush=True)
 
 
@@ -186,16 +191,31 @@ def settings_yield(args) -> bool:
     return getattr(args, "_yield", True)
 
 
-def run_items(plex, settings, state, keys, args) -> int:
+def run_items(plex, settings, state, keys, args, label: str = "") -> int:
     counts: dict[str, int] = {}
-    gate = StreamGate(plex, settings_yield(args) and not args.dry_run)
-    for k in keys:
-        gate.wait()
-        for res in process_item(plex, k, settings, state, dry_run=args.dry_run, force=args.force,
-                                save_to=getattr(args, "save", None)):
-            counts[res.status] = counts.get(res.status, 0) + 1
-            if res.status not in ("up-to-date", "unchanged") or args.verbose:
-                print(res.line(), flush=True)
+    progress = None if args.dry_run else Progress(config_dir() / "progress.json", args.cmd, label)
+    gate = StreamGate(plex, settings_yield(args) and not args.dry_run, progress)
+    if progress:
+        progress.start(len(keys))
+    try:
+        for k in keys:
+            gate.wait()
+            for res in process_item(plex, k, settings, state, dry_run=args.dry_run, force=args.force,
+                                    save_to=getattr(args, "save", None)):
+                counts[res.status] = counts.get(res.status, 0) + 1
+                if progress:
+                    progress.working_on(res.title)
+                    progress.result(res)
+                if res.status not in ("up-to-date", "unchanged") or args.verbose:
+                    print(res.line(), flush=True)
+            if progress:
+                progress.item_done()
+    except BaseException:
+        if progress:
+            progress.finish("stopped")
+        raise
+    if progress:
+        progress.finish()
     state.flush()
     print("Summary: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) if counts else "Nothing to do.")
     return 1 if counts.get("error") else 0
@@ -305,7 +325,7 @@ def cmd_inspect(args):
 def cmd_add(args):
     plex, settings, state = build(args, lock=True)
     keys = resolve_targets(plex, args.target)
-    return run_items(plex, settings, state, keys, args)
+    return run_items(plex, settings, state, keys, args, label=args.target)
 
 
 def cmd_scan(args):
@@ -330,8 +350,9 @@ def cmd_watch(args):
     labels = ", ".join(pair_label(p) for p in settings.pairs)
     print(f"Watching for new items every {args.interval}s ({labels}). Ctrl-C to stop.", flush=True)
     if args.initial_scan:
-        run_items(plex, settings, state, resolve_targets(plex, "all"), args)
-    gate = StreamGate(plex, settings_yield(args))
+        run_items(plex, settings, state, resolve_targets(plex, "all"), args, label="all")
+    progress = Progress(config_dir() / "progress.json", "watch --once" if args.once else "watch", "recently added")
+    gate = StreamGate(plex, settings_yield(args), progress)
     while True:
         try:
             if args.once and gate.playing():
@@ -339,17 +360,50 @@ def cmd_watch(args):
                 print(time.strftime("%Y-%m-%d %H:%M ") + f"skipped: {gate.playing()} Plex stream(s) playing", flush=True)
                 return 0
             keys = plex.recently_added(args.batch)
+            progress.start(len(keys))
             for k in keys:
                 gate.wait()
                 for res in process_item(plex, k, settings, state):
+                    progress.working_on(res.title)
+                    progress.result(res)
                     if res.status not in ("up-to-date", "unchanged"):
                         print(time.strftime("%Y-%m-%d %H:%M ") + res.line(), flush=True)
+                progress.item_done()
+            progress.finish("finished" if args.once else "waiting")
             state.flush()
         except (PlexError, OSError) as e:
             print(f"{time.strftime('%Y-%m-%d %H:%M')} [!] {e}", flush=True)
         if args.once:
             return 0
         time.sleep(args.interval)
+
+
+def cmd_web(args):
+    from . import web
+
+    cfg = load_config()
+    key = web.ensure_key(cfg, save_config)
+
+    def plex_factory():
+        plex, settings, _ = build(args)
+        return plex, settings
+
+    portal = web.Portal(config_dir(), load_config, save_config, plex_factory)
+    try:
+        srv = web.serve(portal, key, args.host, args.port)
+    except OSError as e:
+        sys.exit(f"can't listen on {args.host}:{args.port} ({e}); pick another port with --port")
+    print(f"dualsubs web is running. Open this link (it includes your access key):\n\n"
+          f"  http://localhost:{args.port}/?key={key}\n\n"
+          f"On another computer, tunnel the port over SSH first, e.g.\n"
+          f"  ssh -L {args.port}:127.0.0.1:{args.port} plex-server '~/.local/bin/dualsubs web --port {args.port}'\n"
+          f"Ctrl-C stops it.", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
 
 
 def cmd_merge(args):
@@ -435,6 +489,11 @@ def main(argv=None):
     s = sub.add_parser("remove", parents=[work], help="remove the bilingual tracks dualsubs added")
     s.add_argument("target")
     s.set_defaults(fn=cmd_remove)
+
+    s = sub.add_parser("web", parents=[conn], help="status page: coverage, progress, language pairs")
+    s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--host", default="127.0.0.1", help="address to listen on (default: this machine only)")
+    s.set_defaults(fn=cmd_web)
 
     s = sub.add_parser("merge", parents=[style], help="merge two subtitle files offline (no Plex)")
     s.add_argument("primary_file")

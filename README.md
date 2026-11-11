@@ -11,7 +11,8 @@ Where's the coffee?                ← amber
 I haven't seen it anywhere.        ← amber
 ```
 
-Nothing needs installing on your TV or phone. The track is an ordinary Plex
+Nothing needs installing on your TV or phone. A small status page shows how
+much of your library has bilingual tracks. The track is an ordinary Plex
 subtitle track, so it shows up in every Plex app (Android TV / NVIDIA Shield,
 phone, web), and playback, resume and remote control keep working exactly as
 before. Plex remembers your subtitle choice per show.
@@ -260,6 +261,35 @@ single-file **edge** pre-release. A new version number on `main` also creates a
 regular release, which is what the download link in step 2 points to. To build
 the file yourself, run `./scripts/build-pyz.sh`; the result is `dist/dualsubs`.
 
+## Status page
+
+`dualsubs web` serves a small page that shows:
+
+- **Current run:** what it's doing, how far it is (X of Y), whether it's paused
+  for someone watching, and the latest results.
+- **Library coverage:** for each library and each language pair, how many items
+  have a bilingual track, how many are missing a language (and which language
+  is missing most), and how many haven't been checked yet.
+- **Language pairs:** add or remove pairs, and switch fetching missing
+  subtitles on or off. Changes apply from the next run.
+
+It listens only on the server itself and needs an access key, because on a
+shared seedbox other users can reach the server's local ports too. The easiest
+way to open it is one command from your computer. It starts the page and
+tunnels it to you, and stops when you press Ctrl-C:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 plex-server '~/.local/bin/dualsubs web'
+```
+
+Open the link it prints (`http://localhost:8765/?key=...`) in your browser. The
+key is remembered after the first visit. If port 8765 is taken on the server,
+use another one on both sides, e.g. `ssh -L 8790:127.0.0.1:8790 plex-server
+'~/.local/bin/dualsubs web --port 8790'`.
+
+The page only reads dualsubs' own files and asks Plex for library sizes, so it
+is safe to leave open while a run is going.
+
 ## Language pairs
 
 A pair is written main language first, e.g. `en+es` means English on top and
@@ -298,6 +328,8 @@ dualsubs watch                       # keep running; handle new items every 10 m
 dualsubs remove "The Bear"           # take all bilingual tracks off again
 dualsubs remove "The Bear" --pair en+fr   # ...or just one pair
 dualsubs remove all                  # every track dualsubs ever added
+dualsubs web                         # status page (see above)
+dualsubs doctor                      # check the setup
 dualsubs merge nl.srt en.srt -o both.srt   # offline, no Plex needed
 ```
 

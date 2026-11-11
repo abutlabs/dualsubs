@@ -69,6 +69,9 @@ class Item:
     type: str  # movie | episode
     title: str
     parts: list[Part] = field(default_factory=list)
+    library_id: str = ""
+    library: str = ""
+    show: str = ""  # series title for episodes
 
     @property
     def subtitles(self) -> list[SubStream]:
@@ -151,6 +154,12 @@ class Plex:
                 keys.extend(self.leaves(el.get("ratingKey")))
         return keys
 
+    def library_size(self, section_id: str, kind: str) -> int:
+        """Number of movies (kind 'movie') or episodes (kind 'show') in a library, cheaply."""
+        root = self._xml(f"/library/sections/{section_id}/all", type="1" if kind == "movie" else "4",
+                         **{"X-Plex-Container-Start": "0", "X-Plex-Container-Size": "0"})
+        return int(root.get("totalSize") or root.get("size") or 0)
+
     def leaves(self, rating_key: str) -> list[str]:
         return [v.get("ratingKey") for v in self._xml(f"/library/metadata/{rating_key}/allLeaves").findall("Video")]
 
@@ -195,7 +204,10 @@ class Plex:
             title = f"{v.get('grandparentTitle')} S{int(v.get('parentIndex', 0)):02d}E{int(v.get('index', 0)):02d} {title}"
         elif v.get("year"):
             title = f"{title} ({v.get('year')})"
-        item = Item(rating_key, v.get("type", ""), title)
+        item = Item(rating_key, v.get("type", ""), title,
+                    library_id=v.get("librarySectionID") or root.get("librarySectionID") or "",
+                    library=v.get("librarySectionTitle") or root.get("librarySectionTitle") or "",
+                    show=v.get("grandparentTitle", ""))
         for p in v.iter("Part"):
             part = Part(int(p.get("id")), p.get("file", ""))
             for s in p.findall("Stream"):
