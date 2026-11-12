@@ -131,7 +131,7 @@ class State:
         if self.path:
             _OPEN_STATES.add(self)  # flushed at exit; weak, so a dropped State releases its lock
 
-    def lock(self) -> bool:
+    def lock(self, kind: str = "run") -> bool:
         """Take an exclusive lock for this state file; False if another run holds it.
 
         Two runs writing the same state (a `watch` in tmux plus a cron job, say)
@@ -144,7 +144,8 @@ class State:
         except ImportError:  # Windows: no locking
             return True
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_file = open(self.path.with_name(self.path.name + ".lock"), "w")
+        suffix = ".lock" if kind == "run" else f".{kind}.lock"
+        self._lock_file = open(self.path.with_name(self.path.name + suffix), "w")
         try:
             fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:

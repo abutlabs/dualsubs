@@ -22,7 +22,8 @@ class FakePlex:
         self.requests: list[str] = []
         self.sessions: list[str] = []
         self.catalog: dict[tuple, list[dict]] = {}  # (ratingKey, lang) -> search results
-        self.searches: list[tuple] = []  # player states, e.g. ["playing", "paused"]
+        self.searches: list[tuple] = []
+        self.shows: dict[str, list[str]] = {}  # show ratingKey -> episode ratingKeys, in order  # player states, e.g. ["playing", "paused"]
         self.deny_writes = False  # behave like a shared (non-owner) user
 
     def add_movie(self, rk, title, file, streams, year="2024"):
@@ -53,7 +54,11 @@ class FakePlex:
         if path == "/":
             return 200, '<MediaContainer friendlyName="FakePlex" version="1.41.0" machineIdentifier="fake-machine"/>'
         if path == "/status/sessions":
-            vids = "".join(f'<Video type="episode"><Player state="{s}"/></Video>' for s in self.sessions)
+            vids = "".join(
+                f'<Video type="episode"><Player state="{s}"/></Video>' if isinstance(s, str) else
+                f'<Video type="{s.get("type", "episode")}" ratingKey="{s["rk"]}" grandparentRatingKey="{s.get("show", "")}">'
+                f'<Player state="{s.get("state", "playing")}"/></Video>'
+                for s in self.sessions)
             return 200, f'<MediaContainer size="{len(self.sessions)}">{vids}</MediaContainer>'
         if self.deny_writes and method != "GET":
             return 403, "Forbidden"
@@ -72,6 +77,9 @@ class FakePlex:
             )
             return 200, f'<MediaContainer><Hub type="movie">{hits}</Hub></MediaContainer>'
         parts = path.strip("/").split("/")
+        if parts[:2] == ["library", "metadata"] and parts[3:] == ["allLeaves"] and parts[2] in self.shows:
+            vids = "".join(f'<Video ratingKey="{rk}" type="episode"/>' for rk in self.shows[parts[2]])
+            return 200, f"<MediaContainer>{vids}</MediaContainer>"
         if parts[:2] == ["library", "metadata"] and len(parts) == 3 and method == "GET":
             rk = parts[2]
             return (200, f"<MediaContainer>{self._video(rk)}</MediaContainer>") if rk in self.items else (404, "")

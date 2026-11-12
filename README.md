@@ -188,33 +188,44 @@ ssh plex-server 'tail -f ~/dualsubs.log'        # watch progress; Ctrl-C to stop
 When it finishes, do the next library. Items that are already done are skipped
 cheaply, so it's safe to re-run.
 
-### 6. Handle new items automatically
+### 6. Keep it running: new items, and what you're watching
 
-Add a cron job that checks recently added items every 15 minutes. Unlike tmux,
-cron survives server reboots. Open the crontab with `ssh -t plex-server 'crontab -e'`
-and add:
+Run `dualsubs watch` all the time. It does two things:
 
-```
-*/15 * * * *  $HOME/.local/bin/dualsubs watch --once >> $HOME/dualsubs.log 2>&1
-```
+- **Prepares what you're watching.** It checks what's playing every 15 seconds.
+  When an episode or movie starts, it makes its bilingual tracks straight away,
+  fetching missing subtitles as needed, along with the **next 3 episodes**. The
+  episode you just started is usually ready within a minute (re-open the
+  subtitle menu); the following ones are waiting before you get to them.
+  (`--ahead N` changes how many; `--tick` how often it checks.)
+- **Handles new items** every 10 minutes, stepping aside while anyone is
+  watching.
 
-`watch --once` only looks at recently added items, so each run is quick. Use it
-rather than `scan`, which checks every item every time. Only one dualsubs run
-works at a time. If cron fires while a long run from step 5 is still going, or
-while someone is watching, it logs "skipped" and tries again next time. You
-don't need `flock` or `nice` in the cron line; dualsubs handles both itself.
-
-Add a second, nightly line for subtitles that turn up later on *older* items
-(Plex downloads, Bazarr, a file you added by hand). `watch --once` only looks at
-recently added items, so it would miss those. A full `scan` is cheap once the
-library has been processed: unchanged items are skipped without reading anything.
+It runs alongside a library run from step 5. They never work on the same item
+at once. Start it from cron so it survives reboots and comes back if it ever
+stops (`ssh -t plex-server 'crontab -e'`):
 
 ```
-30 4 * * *  $HOME/.local/bin/dualsubs scan >> $HOME/dualsubs.log 2>&1
+@reboot       $HOME/.local/bin/dualsubs watch >> $HOME/dualsubs.log 2>&1
+*/15 * * * *  $HOME/.local/bin/dualsubs watch >> $HOME/dualsubs.log 2>&1
 ```
 
-(If cron isn't available, `dualsubs watch` keeps running and checks every 10
-minutes, for example in tmux. That stops if the server reboots.)
+The second line is a keep-alive. If `watch` is already running, it exits
+immediately and logs nothing. To start it now without waiting for cron:
+`ssh plex-server 'nohup ~/.local/bin/dualsubs watch >> ~/dualsubs.log 2>&1 &'`.
+
+Add a nightly `scan` for subtitles that turn up later on *older* items (Plex
+downloads, Bazarr, a file you added by hand), and for retrying downloads that
+hit yesterday's limit. Once the library has been processed it's cheap:
+unchanged items are skipped without reading anything.
+
+```
+30 4 * * *    $HOME/.local/bin/dualsubs scan >> $HOME/dualsubs.log 2>&1
+```
+
+(Rather not have anything running all the time? Use
+`*/15 * * * * $HOME/.local/bin/dualsubs watch --once` instead of the two `watch`
+lines. It handles new items, but doesn't prepare what's playing.)
 
 ### Update
 

@@ -163,6 +163,24 @@ class Plex:
                 continue
         return list(dict.fromkeys(keys))
 
+    def now_playing(self) -> list[dict]:
+        """Movies/episodes open in a player right now (playing, buffering or paused)."""
+        out = []
+        for el in self._xml("/status/sessions"):
+            if el.get("type") in ("movie", "episode") and el.get("ratingKey"):
+                player = el.find("Player")
+                out.append({"ratingKey": el.get("ratingKey"), "type": el.get("type"),
+                            "show": el.get("grandparentRatingKey"), "title": el.get("title", ""),
+                            "state": player.get("state") if player is not None else "playing"})
+        return out
+
+    def next_episodes(self, show_key: str, after: str, n: int) -> list[str]:
+        eps = self.leaves(show_key)
+        if after in eps:
+            i = eps.index(after)
+            return eps[i + 1: i + 1 + n]
+        return []
+
     def libraries(self) -> list[dict]:
         return [
             {"id": d.get("key"), "title": d.get("title"), "type": d.get("type")}

@@ -89,11 +89,18 @@ def build(args, lock: bool = False):
         fetch_limit=int(_opt(args, "fetch_limit", "DUALSUBS_FETCH_LIMIT", cfg, 50)),
     )
     state = State(_opt(args, "state", "DUALSUBS_STATE", cfg) or config_dir() / "state.json")
-    if lock and not getattr(args, "dry_run", False) and not state.lock():
-        msg = "another dualsubs run is already working on this library (e.g. `watch` in tmux, or cron); not starting a second one"
+    kind = "daemon" if lock == "daemon" else "run"
+    if lock and not getattr(args, "dry_run", False) and not state.lock(kind):
+        msg = ("`dualsubs watch` is already running" if kind == "daemon" else
+               "another dualsubs run is already working on this library (e.g. a library run in tmux, or cron); "
+               "not starting a second one")
         if getattr(args, "once", False):
             print(time.strftime("%Y-%m-%d %H:%M ") + "skipped: " + msg, flush=True)
             sys.exit(0)  # normal for cron while a long run is busy
+        if kind == "daemon":
+            if sys.stdout.isatty():
+                print(msg)
+            sys.exit(0)  # the cron keep-alive line: nothing to do, and nothing to log
         sys.exit(msg)
     return Plex(url, token), settings, state
 
@@ -399,36 +406,95 @@ def cmd_remove(args):
 
 
 def cmd_watch(args):
+    if args.once:
+        return _watch_once(args)
+    return _watch_daemon(args)
+
+
+def _recent_pass(plex, settings, state, args, progress, gate, stop_for_streams: bool) -> bool:
+    """One pass over recently added items. Returns False if it stopped early for viewers."""
+    keys = plex.recently_added(args.batch)
+    progress.start(len(keys))
+    for k in keys:
+        if stop_for_streams and gate.playing():
+            progress.finish("waiting")
+            return False
+        for res in process_item(plex, k, settings, state):
+            progress.working_on(res.title)
+            progress.result(res)
+            if res.status not in ("up-to-date", "unchanged"):
+                print(time.strftime("%Y-%m-%d %H:%M ") + res.line(), flush=True)
+        progress.item_done()
+    state.flush()
+    return True
+
+
+def _watch_once(args):
+    """From cron: check recently added items once."""
     plex, settings, state = build(args, lock=True)
-    labels = ", ".join(pair_label(p) for p in settings.pairs)
-    print(f"Watching for new items every {args.interval}s ({labels}). Ctrl-C to stop.", flush=True)
-    if args.initial_scan:
-        run_items(plex, settings, state, resolve_targets(plex, "all"), args, label="all")
-    progress = Progress(config_dir() / "progress.json", "watch --once" if args.once else "watch", "recently added")
+    progress = Progress(config_dir() / "progress.json", "watch --once", "recently added")
     gate = StreamGate(plex, settings_yield(args), progress)
-    while True:
+    if gate.playing():
+        print(time.strftime("%Y-%m-%d %H:%M ") + f"skipped: {gate.playing()} Plex stream(s) playing", flush=True)
+        return 0
+    try:
+        _recent_pass(plex, settings, state, args, progress, gate, stop_for_streams=True)
+        progress.finish("finished")
+    except (PlexError, OSError) as e:
+        print(f"{time.strftime('%Y-%m-%d %H:%M')} [!] {e}", flush=True)
+    return 0
+
+
+def _watch_daemon(args):
+    """Keep running: prepare what's being watched right away, and handle new items.
+
+    - Every --tick seconds it looks at what's playing. An episode or movie that
+      starts playing gets its bilingual tracks made immediately (fetching missing
+      subtitles as needed), along with the next --ahead episodes of that show, so
+      the following episodes are ready before they start.
+    - Every --interval seconds it handles recently added items, stepping aside
+      while anyone is watching.
+    It doesn't take the library-run lock, so it runs next to a library run (they
+    never work on the same item at once).
+    """
+    plex, settings, state = build(args, lock="daemon")
+    labels = ", ".join(pair_label(p) for p in settings.pairs)
+    print(f"Watching ({labels}): what's playing every {args.tick}s, new items every {args.interval}s. "
+          "Ctrl-C to stop.", flush=True)
+    if args.initial_scan:
+        run_items(plex, settings, state, prioritize(plex, resolve_targets(plex, "all")), args, label="all")
+    progress = Progress(config_dir() / "progress.json", "watch", "recently added")
+    gate = StreamGate(plex, settings_yield(args), progress)
+    prepared: dict[str, float] = {}  # ratingKey -> when we last made sure it's done
+    next_recent = 0.0
+    ticks = 0
+    while not args.max_ticks or ticks < args.max_ticks:
+        ticks += 1
         try:
-            if args.once and gate.playing():
-                # From cron: just try again next time rather than wait.
-                print(time.strftime("%Y-%m-%d %H:%M ") + f"skipped: {gate.playing()} Plex stream(s) playing", flush=True)
-                return 0
-            keys = plex.recently_added(args.batch)
-            progress.start(len(keys))
-            for k in keys:
-                gate.wait()
-                for res in process_item(plex, k, settings, state):
-                    progress.working_on(res.title)
-                    progress.result(res)
-                    if res.status not in ("up-to-date", "unchanged"):
-                        print(time.strftime("%Y-%m-%d %H:%M ") + res.line(), flush=True)
-                progress.item_done()
-            progress.finish("finished" if args.once else "waiting")
+            playing = plex.now_playing() if args.ahead >= 0 else []
+            for s in playing:
+                targets = [s["ratingKey"]]
+                if s["type"] == "episode" and s["show"] and args.ahead:
+                    targets += plex.next_episodes(s["show"], s["ratingKey"], args.ahead)
+                for k in targets:
+                    if time.time() - prepared.get(k, 0) < 600:
+                        continue
+                    for res in process_item(plex, k, settings, state):
+                        if res.status not in ("up-to-date", "unchanged"):
+                            tag = "now playing" if k == s["ratingKey"] else "coming up"
+                            print(time.strftime("%Y-%m-%d %H:%M ") + f"({tag}) " + res.line(), flush=True)
+                    prepared[k] = time.time()
             state.flush()
+            if time.time() >= next_recent:
+                if _recent_pass(plex, settings, state, args, progress, gate, stop_for_streams=True):
+                    next_recent = time.time() + args.interval
+                    progress.finish("waiting")
         except (PlexError, OSError) as e:
             print(f"{time.strftime('%Y-%m-%d %H:%M')} [!] {e}", flush=True)
-        if args.once:
-            return 0
-        time.sleep(args.interval)
+            time.sleep(min(60, args.interval))
+        if not args.max_ticks or ticks < args.max_ticks:
+            time.sleep(args.tick)
+    return 0
 
 
 def cmd_web(args):
@@ -614,6 +680,10 @@ def main(argv=None):
     s.add_argument("--initial-scan", action="store_true", help="process the whole library first")
     s.add_argument("--once", action="store_true",
                    help="check recently added items once and exit (use this from cron)")
+    s.add_argument("--max-ticks", type=int, default=0, help=argparse.SUPPRESS)  # tests
+    s.add_argument("--tick", type=int, default=15, help="seconds between checks of what's playing (default 15)")
+    s.add_argument("--ahead", type=int, default=3,
+                   help="when an episode plays, also prepare this many next episodes (default 3)")
     s.set_defaults(fn=cmd_watch)
 
     s = sub.add_parser("remove", parents=[work], help="remove the bilingual tracks dualsubs added")

@@ -540,3 +540,29 @@ def test_watched_shows_go_first(plex, monkeypatch):
     monkeypatch.setattr(Plex, "watched_first", lambda self: ["7", "3"])
     monkeypatch.setattr(Plex, "recently_added", lambda self, n=100: ["5", "3", "99"])
     assert prioritize(p, ["1", "2", "3", "4", "5", "6", "7"]) == ["7", "3", "5", "1", "2", "4", "6"]
+
+
+@needs_ffmpeg
+def test_watch_prepares_what_is_playing_and_the_next_episodes(plex, capsys, tmp_path):
+    from dualsubs.pipeline import State
+
+    # A show with five episodes; each has English and Spanish (external) subtitles.
+    for i in range(1, 6):
+        rk = str(200 + i)
+        plex.add_movie(rk, f"Ep {i}", "/nope.mkv", [])
+        plex.items[rk]["type"] = "episode"
+        plex.add_external(rk, 5000 + i, "eng", EN.encode())
+        plex.add_external(rk, 6000 + i, "spa", ES.encode())
+    plex.shows["200"] = [str(200 + i) for i in range(1, 6)]
+    plex.sessions = [{"rk": "202", "show": "200", "state": "playing"}]
+    # A library run is going at the same time (holds the run lock): watch still works.
+    busy = State(tmp_path / "home" / "state.json")
+    assert busy.lock()
+    assert main(["watch", "--pair", "en+es", "--max-ticks", "1", "--tick", "0", "--interval", "999"]) == 0
+    out = capsys.readouterr().out
+    done = sorted(u["rk"] for u in plex.uploads)
+    assert done == ["202", "203", "204", "205"]  # the playing episode + 3 ahead, not episode 1
+    assert "(now playing)" in out and "(coming up)" in out
+    # Recently added items are left alone while someone is watching.
+    assert "101" not in done
+    busy._lock_file.close()
