@@ -24,12 +24,48 @@ jobs:
       - run: pip install pytest
       - run: python -m pytest -q
 
+  real-plex:
+    # End-to-end against a real Plex Media Server in Docker, with a small
+    # generated library. No Plex account: the server lets the runner in via
+    # ALLOWED_NETWORKS; subtitle downloads aren't tested here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update -q && sudo apt-get install -yq ffmpeg
+      - run: pip install pytest
+      - name: Build test library
+        run: ./tests/realplex/make_library.sh /tmp/media
+      - name: Start Plex Media Server
+        run: |
+          docker run -d --name plex --network host \
+            -e TZ=UTC -e ALLOWED_NETWORKS=127.0.0.0/8,172.16.0.0/12,10.0.0.0/8 \
+            -e PLEX_UID=$(id -u) -e PLEX_GID=$(id -g) \
+            -v /tmp/plexconfig:/config -v /tmp/media:/data plexinc/pms-docker:latest
+      - name: Create libraries and wait for the scan
+        run: python tests/realplex/setup_plex.py
+      - name: Run dualsubs against it
+        env:
+          REAL_PLEX_URL: http://127.0.0.1:32400
+          REAL_PLEX_PATH_MAP: /data=/tmp/media
+        run: python -m pytest -v tests/realplex
+      - name: Plex log on failure
+        if: failure()
+        run: docker logs plex 2>&1 | tail -80; ls -la /tmp/plexconfig || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-plex-results
+          path: /tmp/plex-artifacts
+
   release:
     # Builds the single-file `dualsubs` and publishes it:
     #  - "edge": rolling pre-release from every push to main
     #  - "vX.Y.Z": a normal release the first time a new version reaches main
     #    (this is what .../releases/latest/download/dualsubs serves)
-    needs: test
+    needs: [test, real-plex]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     env:

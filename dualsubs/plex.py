@@ -89,8 +89,10 @@ class Plex:
         self.token = token
         self.timeout = timeout
         self.s = session or Session()
+        if token and token.lower() not in ("none", "-"):
+            # "none": a server that lets this network in without signing in (Plex's "allowedNetworks")
+            self.s.headers["X-Plex-Token"] = token
         self.s.headers.update({
-            "X-Plex-Token": token,
             "X-Plex-Product": "dualsubs",
             "X-Plex-Version": __version__,
             "X-Plex-Client-Identifier": "dualsubs",
