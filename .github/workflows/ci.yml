@@ -51,6 +51,14 @@ jobs:
           REAL_PLEX_URL: http://127.0.0.1:32400
           REAL_PLEX_PATH_MAP: /data=/tmp/media
         run: python -m pytest -v tests/realplex
+      - name: Show what Plex returned
+        if: always()
+        run: |
+          echo "== uploaded track labels =="; cat /tmp/plex-artifacts/uploaded-track-labels.txt || true
+          echo; echo "== dualsubs output =="; cat /tmp/plex-artifacts/dualsubs-output.txt || true
+          echo "== an uploaded track =="; head -12 /tmp/plex-artifacts/uploaded-track-*.srt || true
+          echo "== subtitle streams as Plex reports them =="
+          grep -ho '<Stream [^>]*streamType="3"[^>]*>' /tmp/plex-artifacts/item-*.xml || true
       - name: Plex log on failure
         if: failure()
         run: docker logs plex 2>&1 | tail -80; ls -la /tmp/plexconfig || true
