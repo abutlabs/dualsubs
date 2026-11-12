@@ -597,6 +597,22 @@ def _stop(proc, signal) -> None:
             proc.kill()
 
 
+def cmd_lab(args):
+    from . import lab
+
+    plex, settings, state = build(args)
+    keys = resolve_targets(plex, args.target)
+    if len(keys) > 1:
+        print(f"{args.target!r} has {len(keys)} items; using the first: {keys[0]} (pass a ratingKey to choose)")
+    if args.experiment == "time":
+        report = lab.lab_time(plex, keys[0], settings, state, compare=args.compare)
+    else:
+        report = lab.lab_placeholder(plex, keys[0], settings, state, wait_s=args.wait * 60, poll_s=args.poll,
+                                     observe_s=args.observe, compare=args.compare)
+    path = lab.save_report(config_dir(), report)
+    print(f"\nReport saved: {path}")
+
+
 def cmd_merge(args):
     a = parse(Path(args.primary_file).read_bytes(), Path(args.primary_file).suffix[1:])
     b = parse(Path(args.secondary_file).read_bytes(), Path(args.secondary_file).suffix[1:])
@@ -694,6 +710,16 @@ def main(argv=None):
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--host", default="127.0.0.1", help="address to listen on (default: this machine only)")
     s.set_defaults(fn=cmd_web)
+
+    s = sub.add_parser("lab", parents=[work], help="experiments with timings (see README)")
+    s.add_argument("experiment", choices=["time", "placeholder"])
+    s.add_argument("target", help="an episode or movie (title or ratingKey)")
+    s.add_argument("--compare", action="store_true",
+                   help="time: also build without reading the video file; placeholder: build that way")
+    s.add_argument("--wait", type=int, default=30, help="placeholder: minutes to wait for the pick")
+    s.add_argument("--observe", type=int, default=180, help="placeholder: seconds to watch the player afterwards")
+    s.add_argument("--poll", type=float, default=2.0, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_lab)
 
     s = sub.add_parser("ui", help="on your computer: open the server's status page through SSH",
                        description="Run this on your own computer. It connects to HOST over SSH, starts "

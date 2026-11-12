@@ -57,7 +57,8 @@ class FakePlex:
             vids = "".join(
                 f'<Video type="episode"><Player state="{s}"/></Video>' if isinstance(s, str) else
                 f'<Video type="{s.get("type", "episode")}" ratingKey="{s["rk"]}" grandparentRatingKey="{s.get("show", "")}">'
-                f'<Player state="{s.get("state", "playing")}"/></Video>'
+                f'<Media><Part>' + (f'<Stream streamType="3" id="{s["sub"]}" selected="1"/>' if s.get("sub") else "")
+                + f'</Part></Media><Player state="{s.get("state", "playing")}" title="SHIELD"/></Video>'
                 for s in self.sessions)
             return 200, f'<MediaContainer size="{len(self.sessions)}">{vids}</MediaContainer>'
         if self.deny_writes and method != "GET":

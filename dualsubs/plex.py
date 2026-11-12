@@ -174,6 +174,20 @@ class Plex:
                             "state": player.get("state") if player is not None else "playing"})
         return out
 
+    def session_subtitle(self, rating_key: str) -> dict | None:
+        """If `rating_key` is open in a player: its state and the selected subtitle stream id."""
+        for el in self._xml("/status/sessions"):
+            if el.get("ratingKey") != str(rating_key):
+                continue
+            player = el.find("Player")
+            sel = None
+            for s in el.iter("Stream"):
+                if s.get("streamType") == "3" and s.get("selected") in ("1", "true"):
+                    sel = int(s.get("id"))
+            return {"state": player.get("state") if player is not None else "playing",
+                    "subtitle": sel, "player": player.get("title") if player is not None else ""}
+        return None
+
     def next_episodes(self, show_key: str, after: str, n: int) -> list[str]:
         eps = self.leaves(show_key)
         if after in eps:

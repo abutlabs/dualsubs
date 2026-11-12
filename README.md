@@ -419,6 +419,25 @@ For heavier gap-filling (many subtitle sites, automatic re-timing), you can also
 run [Bazarr](https://www.bazarr.media/) next to Plex. dualsubs picks up whatever
 it downloads on the nightly `scan`.
 
+## Experiments: `dualsubs lab`
+
+Tools for measuring and trying things on a real server. Run them over SSH like
+everything else. Each prints a step-by-step timing and saves a JSON report in
+`~/.config/dualsubs/`.
+
+```bash
+# How long does building one episode's tracks take, from scratch?
+# --compare also times it without reading the video file (downloading every language instead).
+dualsubs lab time "<episode or movie>" --compare
+
+# Placeholder test: puts an "EN+NL (tap to prepare)" track on one item, waits for
+# you to pick it on a TV, builds the real track, then logs what the player does.
+dualsubs lab placeholder "<episode or movie>" --pair en+nl
+```
+
+`lab time` replaces that item's dualsubs tracks (rebuilt from scratch);
+`lab placeholder` removes the placeholder again when it's done.
+
 ## Style options
 
 `--color '#80DEEA'` (or `none`), `--italic`, `--secondary-on-top`, and
