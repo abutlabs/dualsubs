@@ -106,7 +106,80 @@ def test_6_web_status_counts():
         p.terminate()
 
 
-def test_7_remove_all():
+# ---------------------------------------------------------------- a simulated TV
+import threading  # noqa: E402
+import time  # noqa: E402
+import urllib.request  # noqa: E402
+import xml.etree.ElementTree as ET  # noqa: E402
+from urllib.parse import urlencode  # noqa: E402
+
+TV = {"X-Plex-Client-Identifier": "dualsubs-fake-tv", "X-Plex-Product": "Plex for Android (TV)",
+      "X-Plex-Device-Name": "FAKE SHIELD", "X-Plex-Platform": "Android", "Accept": "application/xml"}
+
+
+def tv(method, path, **params):
+    r = urllib.request.Request(URL + path + ("?" + urlencode(params) if params else ""), method=method,
+                               data=b"" if method == "PUT" else None, headers=TV)
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        return resp.read()
+
+
+def tv_play(rk, state="playing", subtitle=None):
+    """What a Plex app does when it plays something: (pick a subtitle,) report the timeline."""
+    v = ET.fromstring(tv("GET", f"/library/metadata/{rk}")).find("Video")
+    if subtitle is not None:
+        tv("PUT", f"/library/parts/{v.find('Media/Part').get('id')}", subtitleStreamID=subtitle, allParts="1")
+    tv("GET", "/:/timeline", ratingKey=rk, key=f"/library/metadata/{rk}", state=state, time="5000",
+       duration=v.get("duration", "10000"), identifier="com.plexapp.plugins.library")
+
+
+def episodes():
+    return sorted((v.get("index"), v.get("ratingKey")) for v in ET.fromstring(tv("GET", "/library/sections/2/all", type="4")).iter("Video"))
+
+
+def test_7_watch_prepares_what_is_playing():
+    """A TV starts episode 1: `watch` makes its tracks and those of the next episodes straight away."""
+    ds("remove", "all")
+    (_, e1), (_, e2), (_, e3) = episodes()
+    tv_play(e1)
+    try:
+        out = ds("watch", "--pair", "nl+en", "--pair", "en+es", "--max-ticks", "1", "--tick", "0",
+                 "--interval", "9999", "--ahead", "2")
+    finally:
+        tv_play(e1, "stopped")
+    assert "(now playing) Test Show S01E01 Episode 1 [EN+ES]: added" in out
+    assert "(coming up) Test Show S01E03 Episode 3 [NL+EN]: added" in out
+
+
+def test_8_placeholder_pick_is_detected():
+    """lab placeholder: a TV picks the placeholder; dualsubs notices via the session and builds the track."""
+    ds("remove", "all")
+    (_, e1), _, (_, e3) = episodes()
+    picked = {}
+
+    def the_tv():
+        for _ in range(300):
+            v = ET.fromstring(tv("GET", f"/library/metadata/{e3}")).find("Video")
+            ph = [s.get("id") for s in v.iter("Stream") if "tap to prepare" in (s.get("title") or "")]
+            if ph:
+                picked["at"] = time.time()
+                for _ in range(20):
+                    tv_play(e3, subtitle=ph[0])
+                    time.sleep(1)
+                return
+            time.sleep(0.2)
+
+    threading.Thread(target=the_tv, daemon=True).start()
+    try:
+        out = ds("lab", "placeholder", e3, "--pair", "nl+en", "--wait", "2", "--observe", "3", "--poll", "0.5")
+    finally:
+        tv_play(e3, "stopped")
+    with open(os.path.join(ART, "lab-placeholder-output.txt"), "w") as f:
+        f.write(out)
+    assert "Placeholder picked" in out and "Real track ready" in out and "Placeholder removed" in out
+
+
+def test_9_remove_all():
     ds("remove", "all")
     ins = ds("inspect", "Test Show") + ds("inspect", "library:Movies")
     assert "dualsubs" not in ins.lower()
