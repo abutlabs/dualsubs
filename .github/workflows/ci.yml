@@ -63,6 +63,7 @@ jobs:
           echo "== uploaded track labels =="; cat /tmp/plex-artifacts/uploaded-track-labels.txt || true
           echo; echo "== dualsubs output =="; cat /tmp/plex-artifacts/dualsubs-output.txt || true
           echo "== an uploaded track =="; head -12 /tmp/plex-artifacts/uploaded-track-*.srt || true
+          echo "== lab placeholder on real Plex with a simulated TV =="; cat /tmp/plex-artifacts/lab-placeholder-output.txt || true
           echo "== subtitle streams as Plex reports them =="
           grep -ho '<Stream [^>]*streamType="3"[^>]*>' /tmp/plex-artifacts/item-*.xml || true
       - name: Plex log on failure

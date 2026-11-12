@@ -147,8 +147,9 @@ def test_7_watch_prepares_what_is_playing():
                  "--interval", "9999", "--ahead", "2")
     finally:
         tv_play(e1, "stopped")
-    assert "(now playing) Test Show S01E01 Episode 1 [EN+ES]: added" in out
-    assert "(coming up) Test Show S01E03 Episode 3 [NL+EN]: added" in out
+    assert "(now playing) [+] Test Show S01E01 Episode 1 [EN+ES]: added" in out
+    assert "(coming up) [+] Test Show S01E03 Episode 3 [NL+EN]: added" in out
+    assert "S01E02" not in out  # English only, nothing to do
 
 
 def test_8_placeholder_pick_is_detected():
