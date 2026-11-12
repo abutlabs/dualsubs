@@ -56,19 +56,41 @@ for params in variants:
         print(f"{params} -> HTTP {code}; no new stream ({body[:120]!r})")
 
 print("\n=== 2. simulated player ===")
+
+
+def session_subs():
+    code, body = req("GET", "/status/sessions")
+    root = ET.fromstring(body)
+    out = []
+    for v in root:
+        player = v.find("Player")
+        sel = [(s.get("id"), s.get("selected"), s.get("title"), s.get("languageCode"))
+               for s in v.iter("Stream") if s.get("streamType") == "3"]
+        out.append({"rk": v.get("ratingKey"), "player": player.attrib if player is not None else None,
+                    "subtitle streams in session": sel,
+                    "Session": (v.find("Session").attrib if v.find("Session") is not None else None)})
+    return out
+
+
 v = ET.fromstring(req("GET", f"/library/metadata/{rk}")[1]).find("Video")
 part = v.find("Media/Part")
-sid = next(iter(subs(rk)))
-print("part", part.get("id"), "subtitle to select", sid)
-code, _ = req("PUT", f"/library/parts/{part.get('id')}", subtitleStreamID=sid, allParts="1")
-print("select subtitle via PUT /library/parts ->", code)
-for state in ("playing", "playing", "paused"):
-    code, body = req("GET", "/:/timeline", ratingKey=rk, key=f"/library/metadata/{rk}", state=state, time="5000",
-                     duration=v.get("duration", "40000"), playbackTime="5000", identifier="com.plexapp.plugins.library")
-    print(f"timeline state={state} -> {code} {body[:100]!r}")
-    time.sleep(1)
-    code, body = req("GET", "/status/sessions")
-    print("/status/sessions ->", code, body[:1500].decode(errors="replace"))
-code, body = req("GET", "/video/:/transcode/universal/decision", path=f"/library/metadata/{rk}", directPlay="1",
-                 directStream="1", subtitleStreamID=sid, subtitles="sidecar", protocol="http", mediaIndex="0", partIndex="0")
-print("transcode decision ->", code, body[:600].decode(errors="replace"))
+dur = v.get("duration", "40000")
+# Upload a "placeholder" and select it, as a viewer would on the TV.
+before = set(subs(rk))
+req("POST", f"/library/metadata/{rk}/subtitles", data=SRT, headers={"Accept": "text/plain, */*"},
+    title="dualsubs NL+EN (tap to prepare).nl.srt", format="srt")
+ph = next(k for k in subs(rk) if k not in before)
+print("placeholder stream", ph)
+for sel in (ph, next(k for k in subs(rk) if k != ph)):
+    code, _ = req("PUT", f"/library/parts/{part.get('id')}", subtitleStreamID=sel, allParts="1")
+    print(f"select subtitle {sel} via PUT /library/parts -> {code}")
+    for state in ("playing", "playing"):
+        code, body = req("GET", "/:/timeline", ratingKey=rk, key=f"/library/metadata/{rk}", state=state, time="5000",
+                         duration=dur, playbackTime="5000", identifier="com.plexapp.plugins.library")
+        time.sleep(1)
+    print("  sessions:", session_subs())
+req("GET", "/:/timeline", ratingKey=rk, key=f"/library/metadata/{rk}", state="stopped", time="6000", duration=dur,
+    identifier="com.plexapp.plugins.library")
+time.sleep(1)
+print("after stop, sessions:", session_subs())
+req("DELETE", f"/library/streams/{ph}")
