@@ -50,7 +50,7 @@ class Settings:
     path_map: list = field(default_factory=list)
     min_paired: float = 0.3  # refuse merges where fewer cues line up than this
     filename: str = "dualsubs {P}+{S}.{p}.srt"
-    fetch_missing: bool = False  # ask Plex to search/download a missing language
+    fetch_missing: bool = True  # ask Plex's subtitle search for a missing language
     fetch_limit: int = 50  # max subtitle downloads per day
     fetch_retry_days: int = 30  # don't search again for a language Plex didn't find
 
@@ -194,6 +194,20 @@ class State:
             "lib": item.library_id, "library": item.library, "title": item.title,
             "show": item.show, "type": item.type}
         self._dirty.add(item.rating_key)
+
+    PAUSE_AFTER = 3  # downloads in a row that never arrive: the provider's daily limit, most likely
+
+    def provider_paused(self) -> bool:
+        p = self.data.get("_provider", {})
+        return p.get("date") == time.strftime("%Y-%m-%d") and p.get("paused", False)
+
+    def note_delivery(self, ok: bool) -> None:
+        today = time.strftime("%Y-%m-%d")
+        p = self.data.get("_provider", {})
+        fails = 0 if ok or p.get("date") != today else p.get("fails", 0)
+        fails = 0 if ok else fails + 1
+        self.data["_provider"] = {"date": today, "fails": fails, "paused": fails >= self.PAUSE_AFTER}
+        self._dirty.add("_provider")
 
     @staticmethod
     def _count_today(data: dict) -> int:
@@ -369,8 +383,10 @@ def _context(item: Item, pair: Pair, cfg: Settings, state: State) -> dict:
     done = mine if cfg.mode == "upload" else (prev.get("sidecar") and Path(prev["sidecar"]).exists())
     settled = prev.get("status") in SETTLED
     if settled and prev.get("status") == "missing" and cfg.fetch_missing:
-        # Turning on --fetch-missing reopens items whose missing language we haven't searched for yet.
-        settled = all(state.fetch_note(item.rating_key, lang) for lang in prev.get("missing", []))
+        # Still worth another go unless every missing language was searched recently without luck
+        # (no budget yesterday, a failed download, or fetching just switched on all reopen it).
+        settled = all(_recently_unavailable(state.fetch_note(item.rating_key, lang), cfg)
+                      for lang in prev.get("missing", []))
     return {"prev": prev, "filename": filename, "mine": mine, "sources": sources, "signature": signature,
             "up_to_date": bool(prev.get("signature") == signature and (done or settled))}
 
@@ -414,49 +430,74 @@ def _prefetch_embedded(plex: Plex, item: Item, cfg: Settings, state: State, cach
 
 
 def _fetch_missing(plex: Plex, item: Item, pending: list, cfg: Settings, state: State) -> Item:
-    """Ask Plex to find subtitles for languages a pair lacks (only when the other
-    language is there, so a download always completes a pair). Returns the
-    refreshed item."""
+    """Ask Plex's subtitle search for every language the pending pairs lack, so
+    the pairs can be made. Returns the item, refreshed when anything arrived.
+
+    Pairs missing one language come first (one download completes them); a pair
+    missing both is only started when today's budget covers both downloads.
+    """
     can_read = _can_read(item, cfg)
     sources = [s for s in item.subtitles if not is_ours(s, state.all_stream_ids(item.rating_key))]
-    langs = []
-    for pair in pending:
-        missing = _missing_langs(sources, pair, can_read)
-        if len(missing) == 1 and missing[0] not in langs:
-            langs.append(missing[0])
-    fetched = False
-    for lang in langs:
-        note = state.fetch_note(item.rating_key, lang)
-        if note.get("result") == "none" and time.time() - note.get("at", 0) < cfg.fetch_retry_days * 86400:
-            continue  # searched recently and Plex found nothing
-        if state.fetches_today() >= cfg.fetch_limit:
-            return item  # budget used up; try again tomorrow (nothing recorded)
-        try:
-            found = plex.search_subtitles(item.rating_key, lang)
-        except PlexError:
-            continue
-        if not found:
-            state.set_fetch_note(item.rating_key, lang, {"result": "none", "at": time.time()})
-            continue
-        try:
-            plex.download_found_subtitle(item.rating_key, found[0])
-        except PlexError as e:
-            state.set_fetch_note(item.rating_key, lang, {"result": "error", "at": time.time(), "detail": str(e)[:200]})
-            continue
-        state.count_fetch()
-        state.set_fetch_note(item.rating_key, lang, {"result": "downloaded", "at": time.time(),
-                                                     "from": found[0].get("provider", "")})
-        fetched = True
-    if not fetched:
+    needs = sorted((_missing_langs(sources, pair, can_read) for pair in pending), key=len)
+    if state.provider_paused():
         return item
-    # Plex downloads in the background; wait briefly for the new track(s) to appear.
+    downloaded: list[str] = []
+    tried: set = set()
+    for missing in needs:
+        todo = [lang for lang in missing if lang not in tried and lang not in downloaded]
+        if not todo:
+            continue
+        if any(_recently_unavailable(state.fetch_note(item.rating_key, lang), cfg) for lang in missing):
+            continue  # this pair can't be completed for now; don't spend downloads on half of it
+        if state.fetches_today() + len(todo) > cfg.fetch_limit:
+            continue  # not enough budget left today to complete this pair
+        for lang in todo:
+            tried.add(lang)
+            try:
+                found = plex.search_subtitles(item.rating_key, lang) \
+                    or plex.search_subtitles(item.rating_key, lang, allow_sdh=True)  # better than nothing
+            except PlexError:
+                continue
+            if not found:
+                state.set_fetch_note(item.rating_key, lang, {"result": "none", "at": time.time()})
+                break  # the pair can't be completed: skip its other language
+            try:
+                plex.download_found_subtitle(item.rating_key, found[0])
+            except PlexError as e:
+                state.set_fetch_note(item.rating_key, lang, {"result": "error", "at": time.time(), "detail": str(e)[:200]})
+                break
+            state.count_fetch()
+            state.set_fetch_note(item.rating_key, lang, {"result": "downloaded", "at": time.time(),
+                                                         "from": found[0].get("provider", ""),
+                                                         "exact": found[0].get("perfect", False)})
+            downloaded.append(lang)
+    if not downloaded:
+        return item
+    # Plex downloads in the background; wait for the new track(s) to show up.
+    fresh = item
     for _ in range(FETCH_WAIT_TRIES):
         fresh = plex.item(item.rating_key)
         have = {s.language for s in fresh.subtitles if s.is_text}
-        if all(lang in have for lang in langs if state.fetch_note(item.rating_key, lang).get("result") == "downloaded"):
-            return fresh
+        if all(lang in have for lang in downloaded):
+            break
         time.sleep(FETCH_WAIT_S)
-    return plex.item(item.rating_key)
+    have = {s.language for s in fresh.subtitles if s.is_text}
+    for lang in downloaded:
+        arrived = lang in have
+        if not arrived:
+            state.set_fetch_note(item.rating_key, lang, {"result": "not-delivered", "at": time.time()})
+        state.note_delivery(arrived)
+    return fresh
+
+
+def _recently_unavailable(note: dict, cfg: Settings) -> bool:
+    """A search that found nothing isn't repeated for a while; failures are retried the next day."""
+    age = time.time() - note.get("at", 0)
+    if note.get("result") == "none":
+        return age < cfg.fetch_retry_days * 86400
+    if note.get("result") in ("error", "not-delivered"):
+        return age < 20 * 3600
+    return False
 
 
 FETCH_WAIT_TRIES, FETCH_WAIT_S = 15, 2
@@ -522,12 +563,18 @@ def _process_pair(plex: Plex, item: Item, pair: Pair, cfg: Settings, state: Stat
             why = ("only image-based (PGS/VobSub) subtitles, which can't be merged as text"
                    if _image_only(sources, lang) else "no subtitles")
             note = state.fetch_note(item.rating_key, lang)
-            if cfg.fetch_missing and dry_run:
-                why += " (--fetch-missing would search Plex for them)"
+            if not cfg.fetch_missing:
+                pass
+            elif dry_run:
+                why += " (a real run would search Plex's subtitle provider)"
             elif note.get("result") == "none":
                 why += "; Plex's subtitle search found none"
-            elif cfg.fetch_missing and len(missing) == 1 and not note and state.fetches_today() >= cfg.fetch_limit:
-                why += "; daily download limit reached, will search another day"
+            elif note.get("result") == "not-delivered":
+                why += "; a download was requested but never arrived (retrying tomorrow)"
+            elif state.provider_paused():
+                why += "; Plex's subtitle provider stopped delivering today, retrying tomorrow"
+            elif not note and state.fetches_today() >= cfg.fetch_limit:
+                why += "; today's download limit is used up, retrying tomorrow"
             whys.append(f"{lang_name(lang)}: {why}")
         return result("missing", "; ".join(whys), missing=missing)
 

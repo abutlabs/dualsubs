@@ -77,7 +77,8 @@ class FakePlex:
             return (200, f"<MediaContainer>{self._video(rk)}</MediaContainer>") if rk in self.items else (404, "")
         if parts[:2] == ["library", "metadata"] and parts[3:] == ["subtitles"] and method == "GET":
             rk, lang = parts[2], query["language"][0]
-            self.searches.append((rk, lang))
+            sdh_ok = query.get("hearingImpaired") != ["3"]
+            self.searches.append((rk, lang) if not sdh_ok else (rk, lang, "sdh-ok"))
             res = "".join(
                 f'<Stream id="{80000 + i}" streamType="3" key="{r["key"]}" codec="srt" languageCode="{lang}" '
                 f'providerTitle="OpenSubtitles" score="{r.get("score", 1)}" perfectMatch="{r.get("perfect", 0)}"/>'

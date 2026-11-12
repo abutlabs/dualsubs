@@ -131,7 +131,9 @@ class Portal:
             "pairs": [{"key": "+".join(p), "label": pair_label(p)} for p in pairs],
             "languages": sorted(({"code": c, "name": n} for c, n in NAMES.items()), key=lambda x: x["name"]),
             "progress": progress.read(self.config_dir / "progress.json"),
-            "fetch": {"enabled": bool(cfg.get("fetch_missing")), "limit": cfg.get("fetch_limit", 50),
+            "fetch": {"enabled": bool(cfg.get("fetch_missing", True)), "limit": cfg.get("fetch_limit", 50),
+                      "paused": state.get("_provider", {}).get("paused", False)
+                      and state.get("_provider", {}).get("date") == time.strftime("%Y-%m-%d"),
                       "today": budget.get("count", 0) if budget.get("date") == time.strftime("%Y-%m-%d") else 0},
             "now": time.time(),
         })
@@ -374,7 +376,7 @@ see which language below. "Not checked" items haven't been processed yet.</p></d
 <p class="mute small">Each pair becomes its own subtitle track. Changes apply from the next run: a run that's
 already going keeps its pairs. Removing a pair here doesn't delete existing tracks from Plex
 (<code>dualsubs remove all --pair xx+yy</code> does).</p>
-<p><label><input type="checkbox" id="fetch"> Fetch missing subtitles from Plex's subtitle search</label>
+<p><label><input type="checkbox" id="fetch"> Fetch missing languages from Plex's subtitle search (recommended)</label>
 <span class="mute small" id="fetchinfo"></span></p><p class="bad small" id="err"></p></div>
 <div class="card"><h2>Recent results</h2><ul class="recent" id="recent"></ul></div>
 <p class="mute small" id="foot"></p>
@@ -412,7 +414,7 @@ function render(){
  const Pp=$("pairs");Pp.replaceChildren();s.pairs.forEach(pr=>{const pill=el("span",pr.label,"pill");const x=el("button","×");x.title="Remove "+pr.label;
   x.onclick=async()=>{if(s.pairs.length<2){$("err").textContent="Keep at least one pair.";return}if(await post("/api/pairs",{pairs:s.pairs.filter(q=>q.key!==pr.key).map(q=>q.key)}))load()};
   pill.append(x);Pp.append(pill)});
- $("fetch").checked=s.fetch.enabled;$("fetchinfo").textContent=` · ${s.fetch.today}/${s.fetch.limit} downloads today`;
+ $("fetch").checked=s.fetch.enabled;$("fetchinfo").textContent=` · ${s.fetch.today}/${s.fetch.limit} downloads today`+(s.fetch.paused?" · provider stopped delivering today, resuming tomorrow":"");
  // recent
  const R=$("recent");R.replaceChildren();((p&&p.recent)||[]).forEach(x=>{const li=el("li");li.append(el("span",ago(x.at)+"  ","mute"));li.append(el("span",x.line));R.append(li)});
  if(!R.children.length)R.append(el("li","Nothing yet.","mute"));
@@ -438,7 +440,7 @@ async function openTitle(key,title){TITLE={key,title};const T=$("title");T.repla
   sum.append(el("b",p.label+": "));sum.append(el("span",parts.join(", ")+"   "))});T.append(sum);
  const ready=Object.values(d.summary).reduce((a,s)=>a+(s.ready||0),0);
  const acts=el("p");const mk=el("button",`Make tracks (${ready} ready)`,"ghost");mk.disabled=!ready;mk.onclick=()=>repair(false);acts.append(mk);acts.append(document.createTextNode(" "));
- const rp=el("button",`Repair: fetch missing subtitles + make tracks`,"act");rp.onclick=()=>repair(true);acts.append(rp);T.append(acts);
+ const rp=el("button",`Do this now: fetch missing subtitles + make tracks`,"act");rp.onclick=()=>repair(true);acts.append(rp);T.append(acts);
  T.append(el("p",`Repair can fetch about ${d.downloads_needed} subtitle file(s) where one language is missing (${d.downloads_left} of ${d.fetch_limit} downloads left today). Plex's subtitle search is asked for subtitles matching this exact release first; if timing still doesn't line up, that item is skipped rather than given bad subtitles.`,"mute small"));
  if(d.truncated)T.append(el("p","Showing the first 500 episodes.","mute small"));
  const box=el("div",null,"scroll"),tb=el("table"),h=el("tr");h.append(el("th",d.items.length>1?"Episode":"Title"));d.pairs.forEach(p=>h.append(el("th",p.label)));h.append(el("th","Subtitles"));tb.append(h);

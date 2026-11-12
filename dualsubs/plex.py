@@ -136,6 +136,33 @@ class Plex:
                 n += 1
         return n
 
+    def watched_first(self) -> list[str]:
+        """Items to give the daily download budget to first: everything in shows on
+        Continue Watching or watched in the last weeks, and those movies."""
+        keys: list[str] = []
+        shows: list[str] = []
+        sources = [("/library/onDeck", {}),
+                   ("/status/sessions/history/all", {"sort": "viewedAt:desc",
+                                                     "viewedAt>": str(int(time.time()) - 30 * 86400),
+                                                     "X-Plex-Container-Size": "300"})]
+        for path, params in sources:
+            try:
+                root = self._xml(path, **params)
+            except PlexError:
+                continue
+            for v in root:
+                if v.get("type") == "episode" and v.get("grandparentRatingKey"):
+                    if v.get("grandparentRatingKey") not in shows:
+                        shows.append(v.get("grandparentRatingKey"))
+                elif v.get("type") == "movie" and v.get("ratingKey"):
+                    keys.append(v.get("ratingKey"))
+        for show in shows:
+            try:
+                keys.extend(self.leaves(show))
+            except PlexError:
+                continue
+        return list(dict.fromkeys(keys))
+
     def libraries(self) -> list[dict]:
         return [
             {"id": d.get("key"), "title": d.get("title"), "type": d.get("type")}
@@ -239,14 +266,15 @@ class Plex:
             raise PlexError(f"Subtitle stream {stream.id} has neither a key nor a container index")
         return extract_embedded(map_path(part.file, path_map), stream.index, stream.codec)
 
-    def search_subtitles(self, rating_key: str, lang: str) -> list[dict]:
+    def search_subtitles(self, rating_key: str, lang: str, allow_sdh: bool = False) -> list[dict]:
         """Plex's own on-demand subtitle search (OpenSubtitles), best match first.
 
         This is what "Search subtitles" in a Plex app does. Only text formats are
         returned, preferring exact release matches and non-SDH.
         """
+        # hearingImpaired 3 = only non-SDH, 0 = prefer non-SDH; forced 3 = only full subtitles
         root = self._xml(f"/library/metadata/{rating_key}/subtitles",
-                         language=lang, hearingImpaired="3", forced="3")  # 3 = exclude SDH / forced
+                         language=lang, hearingImpaired="0" if allow_sdh else "3", forced="3")
         found = []
         for s in root.iter("Stream"):
             codec = (s.get("codec") or s.get("format") or "").lower()

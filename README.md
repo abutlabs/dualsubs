@@ -34,12 +34,12 @@ before. Plex remembers your subtitle choice per show.
 5. It remembers what it did, so re-runs skip finished items, and it refreshes an
    item when its source subtitles change.
 
-dualsubs combines subtitles that already exist. A pair is only made when **both**
-languages are there, and that is checked from Plex's metadata *before* any video
-file is read. Items that can't make a pair are noted and skipped on later runs
-until their subtitles change. In practice many items have subtitles in only one
-language (WEB-DL releases usually carry many languages, other releases often
-only English). To fill those gaps, see [Fetching missing subtitles](#fetching-missing-subtitles).
+Your releases often won't include every language you want: WEB-DL releases
+usually carry many, others often only English. So when a pair is missing a
+language, dualsubs **fetches it as part of the normal run**. It uses Plex's
+built-in subtitle search, the same one as "Search subtitles" in a Plex app, then
+merges. See [Fetching missing subtitles](#fetching-missing-subtitles). The check for
+what's missing uses Plex's metadata only, *before* any video file is read.
 
 ## Install
 
@@ -271,7 +271,7 @@ The status page runs on the server and you open it from your own computer:
   subtitle languages exist and whether each pair is **done**, **ready** (both
   languages there; the next run makes it) or **missing** a language. This only
   reads Plex's information, never the video files.
-- **Repair:** one button per show or movie. It fetches the missing language
+- **Do this now:** one button per show or movie. It fetches the missing language
   through Plex's subtitle search, asking for subtitles that match your exact
   release first, then makes the tracks. It stays within the daily download
   limit, shows progress, pauses for viewers, and can run while a library run is
@@ -375,29 +375,38 @@ prints what Plex calls it.
 
 ## Fetching missing subtitles
 
-With `--fetch-missing` (or `"fetch_missing": true` in the config), dualsubs asks
-Plex's built-in subtitle search, the same one as "Search subtitles" in a Plex
-app, to download the language a pair is missing, then merges as usual:
+This is on by default. Whenever a run finds a pair missing a language, it asks
+Plex's subtitle search for that language, waits for Plex to download it, and
+merges. That covers the library fill-in, the 15-minute cron run and the nightly
+scan.
 
-```bash
-dualsubs add library:Movies --fetch-missing
-```
+- **Matching your copy:** it asks for subtitles matched to your exact release
+  first, then any match. Full subtitles are preferred, but if there are none,
+  hearing-impaired ones are used rather than nothing. A file timed for another
+  release is re-synced automatically. If the timing still doesn't line up, the
+  item is skipped ("poor timing") rather than given bad subtitles.
+- **Both languages missing** (e.g. no text English either): both are fetched,
+  but only when today's budget covers both. Half a pair is useless.
+- **Daily limit:** Plex's subtitle provider limits downloads, so dualsubs uses at
+  most **50 per day** (`--fetch-limit N`, or `"fetch_limit"` in the config). If
+  downloads stop arriving (three in a row requested but never delivered, usually
+  the provider's own limit), it stops asking until tomorrow. The status page
+  shows when that happens.
+- **What you watch goes first:** in a library run or `scan`, shows on your
+  Continue Watching list or watched in the last 30 days are done first, then
+  newly added items, then the rest. That way the daily downloads go where they
+  matter.
+- **No pestering:** a title with no subtitles available isn't searched again for
+  30 days. Failed downloads are retried the next day.
+- To switch it off: `--no-fetch`, `"fetch_missing": false` in the config, or the
+  checkbox on the status page.
 
-- It only searches when the **other** language of the pair is already there, so
-  every download completes a pair.
-- It prefers exact release matches and skips SDH and forced subtitles. A
-  downloaded file is often timed for a different release; the automatic re-sync
-  takes care of that. If the timing still doesn't match, the item is skipped
-  ("barely line up") instead of getting bad subtitles.
-- Plex's subtitle provider limits downloads, so dualsubs caps them at **50 per
-  day** (`--fetch-limit N`). When the cap is reached, it carries on merging and
-  searches again the next day. If a search finds nothing, that title isn't
-  searched again for 30 days.
-- Turning it on later reopens items that were skipped for a missing language.
+The status page's **Do this now** button does the same for one show or movie
+right away, instead of waiting for its turn.
 
-For heavier gap-filling (many subtitle sites, automatic re-timing), run
-[Bazarr](https://www.bazarr.media/) next to Plex. dualsubs picks up whatever it
-downloads on the nightly `scan`.
+For heavier gap-filling (many subtitle sites, automatic re-timing), you can also
+run [Bazarr](https://www.bazarr.media/) next to Plex. dualsubs picks up whatever
+it downloads on the nightly `scan`.
 
 ## Style options
 

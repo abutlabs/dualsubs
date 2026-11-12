@@ -392,14 +392,15 @@ def test_fetch_missing_downloads_then_merges(plex, capsys):
 def test_fetch_missing_none_found_is_not_repeated(plex, capsys):
     _only_english_external(plex)
     main(["add", "101", "--pair", "en+es", "--fetch-missing"])
-    assert plex.searches == [("101", "es")]
+    # Full subtitles first, then (nothing found) hearing-impaired ones are accepted too.
+    assert plex.searches == [("101", "es"), ("101", "es", "sdh-ok")]
     assert "Spanish: no subtitles; Plex's subtitle search found none" in capsys.readouterr().out
     main(["add", "101", "--pair", "en+es", "--fetch-missing"])
-    assert plex.searches == [("101", "es")]  # remembered for 30 days
+    assert len(plex.searches) == 2  # remembered for 30 days
 
 
 @needs_ffmpeg
-def test_fetch_missing_respects_daily_limit_and_needs_one_language(plex, capsys, tmp_path):
+def test_fetch_respects_daily_limit_and_fetches_both_languages(plex, capsys, tmp_path):
     import json
     import time as _t
 
@@ -409,19 +410,24 @@ def test_fetch_missing_respects_daily_limit_and_needs_one_language(plex, capsys,
     state = tmp_path / "home" / "state.json"
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(json.dumps({"_budget": {"date": _t.strftime("%Y-%m-%d"), "count": 2}}))
-    main(["add", "101", "--pair", "en+es", "--fetch-missing", "--fetch-limit", "2"])
-    assert plex.searches == [] and "daily download limit reached" in capsys.readouterr().out
-    # es+fr: both missing, so a single download couldn't complete the pair: don't search at all.
-    main(["add", "101", "--pair", "es+fr", "--fetch-missing", "--fetch-limit", "10"])
+    main(["add", "101", "--pair", "en+es", "--fetch-limit", "2"])
+    assert plex.searches == [] and "today's download limit is used up" in capsys.readouterr().out
+    # es+fr: both missing. With one download left it isn't started (half a pair is useless)...
+    main(["add", "101", "--pair", "es+fr", "--fetch-limit", "3"])
     assert plex.searches == []
+    # ...with two left, both languages are fetched and the pair is made.
+    main(["add", "101", "--pair", "es+fr", "--fetch-limit", "4"])
+    assert [s[1] for s in plex.searches] == ["es", "fr"]
+    assert "[ES+FR]: added" in capsys.readouterr().out
 
 
 @needs_ffmpeg
-def test_enabling_fetch_missing_reopens_missing_items(plex, capsys):
+def test_fetching_again_reopens_missing_items(plex, capsys):
     _only_english_external(plex)
-    main(["add", "101", "--pair", "en+es"])  # recorded as missing
+    main(["add", "101", "--pair", "en+es", "--no-fetch"])  # recorded as missing, nothing searched
+    assert plex.searches == []
     plex.catalog[("101", "es")] = [{"key": "/os/es-1", "text": ES.encode()}]
-    main(["add", "101", "--pair", "en+es", "--fetch-missing"])
+    main(["add", "101", "--pair", "en+es"])  # fetching is on by default
     assert "[EN+ES]: added" in capsys.readouterr().out
 
 
@@ -489,3 +495,48 @@ def test_state_from_older_versions_is_still_up_to_date(plex, capsys, tmp_path):
     main(["add", "101", "--pair", "nl+en", "-v"])
     assert "up-to-date" in capsys.readouterr().out and len(plex.uploads) == 1
     assert State(path).get("101", ("nl", "en"))["signature"] != old  # upgraded in place
+
+
+@needs_ffmpeg
+def test_provider_that_stops_delivering_is_paused_for_the_day(plex, capsys, monkeypatch):
+    from dualsubs import pipeline
+
+    monkeypatch.setattr(pipeline, "FETCH_WAIT_TRIES", 1)
+    monkeypatch.setattr(pipeline, "FETCH_WAIT_S", 0)
+    _only_english_external(plex)
+    # Plex accepts the download request but the subtitle never shows up (provider limit hit).
+    plex.catalog[("101", "es")] = [{"key": "/os/es-1", "text": ES.encode()}]
+    plex.handle_original = plex.handle
+
+    def handle(method, path, query, body):
+        if method == "PUT" and path.endswith("/subtitles"):
+            plex.requests.append(f"{method} {path}")
+            return 200, ""
+        return plex.handle_original(method, path, query, body)
+
+    plex.handle = handle
+    for pair in ("en+es", "en+fr", "en+de"):
+        plex.catalog[("101", pair[-2:])] = [{"key": f"/os/{pair}", "text": ES.encode()}]
+    main(["add", "101", "--pair", "en+es", "--pair", "en+fr", "--pair", "en+de"])
+    out = capsys.readouterr().out
+    assert "never arrived" in out
+    from dualsubs.pipeline import State
+    import os
+    st = State(os.path.join(os.environ["DUALSUBS_HOME"], "state.json"))
+    assert st.provider_paused()
+    n = len(plex.searches)
+    plex.catalog[("101", "it")] = [{"key": "/os/it", "text": ES.encode()}]
+    main(["add", "101", "--pair", "en+it"])
+    assert len(plex.searches) == n  # no more requests today
+    assert "stopped delivering today" in capsys.readouterr().out
+
+
+def test_watched_shows_go_first(plex, monkeypatch):
+    from dualsubs.cli import prioritize
+    from dualsubs.plex import Plex
+    import os
+
+    p = Plex(os.environ["PLEX_URL"], "test-token")
+    monkeypatch.setattr(Plex, "watched_first", lambda self: ["7", "3"])
+    monkeypatch.setattr(Plex, "recently_added", lambda self, n=100: ["5", "3", "99"])
+    assert prioritize(p, ["1", "2", "3", "4", "5", "6", "7"]) == ["7", "3", "5", "1", "2", "4", "6"]

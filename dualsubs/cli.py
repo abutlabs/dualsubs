@@ -83,7 +83,9 @@ def build(args, lock: bool = False):
         style=style_from(args, cfg),
         mode=_opt(args, "mode", "DUALSUBS_MODE", cfg, "upload"),
         path_map=path_map,
-        fetch_missing=bool(getattr(args, "fetch_missing", False) or cfg.get("fetch_missing", False)),
+        fetch_missing=bool(getattr(args, "fetch_missing", False)) or (
+            not getattr(args, "no_fetch", False) and bool(cfg.get("fetch_missing", True))
+            and os.environ.get("DUALSUBS_FETCH", "1") != "0"),
         fetch_limit=int(_opt(args, "fetch_limit", "DUALSUBS_FETCH_LIMIT", cfg, 50)),
     )
     state = State(_opt(args, "state", "DUALSUBS_STATE", cfg) or config_dir() / "state.json")
@@ -355,12 +357,27 @@ def cmd_check(args):
     for lab, counts in totals.items():
         print(f"{lab}: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
     print("\n'ready' items get their track on the next run. For 'no xx', "
-          "`dualsubs add <title> --fetch-missing` searches Plex's subtitle provider for the missing language.")
+          "`dualsubs add <title>` asks Plex's subtitle search for the missing language (on by default).")
+
+
+def prioritize(plex: Plex, keys: list[str]) -> list[str]:
+    """Order a big batch so what you're watching gets today's subtitle downloads first:
+    shows on Continue Watching / watched lately, then recently added, then the rest."""
+    try:
+        first = plex.watched_first() + plex.recently_added(200)
+    except PlexError:
+        return keys
+    wanted = set(keys)
+    head = [k for k in dict.fromkeys(first) if k in wanted]
+    seen = set(head)
+    return head + [k for k in keys if k not in seen]
 
 
 def cmd_add(args):
     plex, settings, state = build(args, lock=True)
     keys = resolve_targets(plex, args.target)
+    if args.target == "all" or args.target.startswith("library:"):
+        keys = prioritize(plex, keys)
     return run_items(plex, settings, state, keys, args, label=args.target)
 
 
@@ -552,11 +569,12 @@ def main(argv=None):
     work.add_argument("--priority", choices=["low", "idle", "normal"],
                       help="CPU/disk priority for reading video files: low (default) yields to Plex and seeding, "
                            "idle only reads when the disk is otherwise unused, normal is full speed")
-    work.add_argument("--fetch-missing", action="store_true",
-                      help="when a pair lacks one language, ask Plex's subtitle search to download it "
-                           "(capped per day; see --fetch-limit)")
+    work.add_argument("--no-fetch", action="store_true",
+                      help="don't ask Plex's subtitle search for missing languages (it does by default, "
+                           "within a daily limit; see --fetch-limit)")
+    work.add_argument("--fetch-missing", action="store_true", help=argparse.SUPPRESS)  # default since 0.5
     work.add_argument("--fetch-limit", type=int, metavar="N",
-                      help="max subtitle downloads per day with --fetch-missing (default 50)")
+                      help="max subtitle downloads per day (default 50)")
     work.add_argument("--ignore-streams", action="store_true",
                       help="don't pause while someone is watching on Plex (default: pause)")
     work.add_argument("-n", "--dry-run", action="store_true", help="show what would happen, change nothing")
