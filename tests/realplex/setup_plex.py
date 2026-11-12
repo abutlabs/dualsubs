@@ -74,15 +74,22 @@ LIBS = [
                                        ("com.plexapp.agents.none", "Plex Series Scanner"),
                                        ("tv.plex.agents.series", "Plex TV Series")]),
 ]
-for name, kind, loc, combos in LIBS:
+def create(name, kind, loc, combos):
     for agent, scanner in combos:
-        code, body = req("POST", "/library/sections", name=name, type=kind, agent=agent, scanner=scanner,
-                         language="xn" if "none" in agent else "en-US", location=loc)
-        print(f"create {name} with {agent} / {scanner} -> {code} {body[:120]!r}", flush=True)
+        for _ in range(60):  # a fresh server answers "still starting up" for a while
+            code, body = req("POST", "/library/sections", name=name, type=kind, agent=agent, scanner=scanner,
+                             language="xn" if "none" in agent else "en-US", location=loc)
+            if b"starting up" not in body:
+                break
+            time.sleep(3)
+        print(f"create {name} with {agent} / {scanner} -> {code} {body[:160]!r}", flush=True)
         if code in (200, 201):
-            break
-    else:
-        sys.exit(f"could not create library {name}")
+            return
+    sys.exit(f"could not create library {name}")
+
+
+for name, kind, loc, combos in LIBS:
+    create(name, kind, loc, combos)
 save("sections.xml", "/library/sections")
 sections = {d.get("title"): d.get("key") for d in xml("/library/sections").findall("Directory")}
 print("sections:", sections, flush=True)
