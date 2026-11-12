@@ -51,6 +51,12 @@ jobs:
           REAL_PLEX_URL: http://127.0.0.1:32400
           REAL_PLEX_PATH_MAP: /data=/tmp/media
         run: python -m pytest -v tests/realplex
+      - name: Explore Plex behaviour (informational)
+        if: always()
+        continue-on-error: true
+        env:
+          REAL_PLEX_URL: http://127.0.0.1:32400
+        run: python tests/realplex/explore.py
       - name: Show what Plex returned
         if: always()
         run: |
